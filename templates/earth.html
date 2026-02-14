@@ -520,6 +520,14 @@ select:focus,
 
   <dt class="col-sm-5">Magnitude</dt>
   <dd class="col-sm-7" id="eq_mag">-</dd>
+<dt class="col-sm-5">Risk Level</dt>
+<dd class="col-sm-7">
+  <span id="riskLevelText" class="fw-bold text-muted">
+    No Risk
+  </span>
+</dd>
+
+
 
   <dt class="col-sm-5">Nearest Place</dt>
   <dd class="col-sm-7"><i id="eq_place">-</i></dd>
@@ -573,40 +581,44 @@ select:focus,
         <h5 class="card-title">Latest Data</h5>
         <h6 class="card-subtitle mb-2 text-muted">Table depicts the latest queries for the prediction model</h6>
         <div class="mt-3">
-<table class="table table-hover text-center">
-  <tr>
-    <th>Latitude</th>
-    <th>Longitude</th>
-    <th>Depth</th>
-    <th>Magnitude (real / predicted)</th>
-    <th>Alert Status</th>
-    <th>Predicted Date</th>
-  </tr>
-  {% for r in rows %}
+<table id="latestTable" class="table table-hover text-center">
+  <thead>
     <tr>
-        <td>{{ r.lat or "-" }}</td>
-        <td>{{ r.lon or "-" }}</td>
-        <td>{{ r.depth or 0 }}</td>
-        <td>
-            {% if r.real_mag is not none %}
-                <strong>{{ r.real_mag }}</strong> <small>(real)</small>
-                <div class="small text-muted">
-                    nearby: {{ r.real_place or "No recent quake" }}
-                    ({{ r.real_dist_km if r.real_dist_km is not none else 0 }} km)
-                </div>
-            {% elif r.predicted_mag is not none %}
-                <strong>{{ r.predicted_mag }}</strong> <small>(predicted)</small>
-            {% else %}
-                <strong>0</strong> <small>(real)</small>
-                <div class="small text-muted">
-                    nearby: No recent quake (0 km)
-                </div>
-            {% endif %}
-        </td>
-        <td>{{ r.alert or "-" }}</td>
-        <td>{{ r.date or "-" }}</td>
+      <th>Latitude</th>
+      <th>Longitude</th>
+      <th>Depth</th>
+      <th>Magnitude (real / predicted)</th>
+      <th>Alert Status</th>
+      <th>Predicted Date</th>
     </tr>
-  {% endfor %}
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr data-user-id="{{ r.id }}">
+      <td>{{ r.lat or "-" }}</td>
+      <td>{{ r.lon or "-" }}</td>
+      <td>{{ r.depth or 0 }}</td>
+      <td>
+          {% if r.real_mag is not none %}
+              <strong>{{ r.real_mag }}</strong> <small>(real)</small>
+              <div class="small text-muted">
+                  nearby: {{ r.real_place or "No recent quake" }}
+                  ({{ r.real_dist_km if r.real_dist_km is not none else 0 }} km)
+              </div>
+          {% elif r.predicted_mag is not none %}
+              <strong>{{ r.predicted_mag }}</strong> <small>(predicted)</small>
+          {% else %}
+              <strong>0</strong> <small>(real)</small>
+              <div class="small text-muted">
+                  nearby: No recent quake (0 km)
+              </div>
+          {% endif %}
+      </td>
+      <td>{{ r.alert or "-" }}</td>
+      <td>{{ r.date or "-" }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
 </table>
 
         </div>
@@ -664,7 +676,26 @@ select:focus,
 <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
 
 <script>
+let lastVoiceState = null; // remember last spoken message
 
+function speakStatus(text) {
+    if (!("speechSynthesis" in window)) return;
+
+    // same message repeat mat bolo
+    if (lastVoiceState === text) return;
+    lastVoiceState = text;
+
+    // stop previous voice
+    window.speechSynthesis.cancel();
+
+    const msg = new SpeechSynthesisUtterance(text);
+    msg.lang = "en-IN";
+    msg.rate = 0.95;
+    msg.pitch = 1;
+    msg.volume = 1;
+
+    window.speechSynthesis.speak(msg);
+}
 function sendManualAlert() {
 
     // ❌ Frontend validation
@@ -846,7 +877,7 @@ let userDate  = {{ date | tojson if date is not none else 'null' }};
 ============================ */
 const eqHead   = document.querySelector("#eq_main_heading");
 const eqSub    = document.querySelector("#eq_sub_heading");
-const tableBody = document.getElementById("liveTableBody");
+//const tableBody = document.getElementById("liveTableBody");
 
 /* Initial headings */
 eqHead.textContent = "Loading real-time earthquake data…";
@@ -939,18 +970,57 @@ let cachedUserPlace = null;
 
 
 function getOceanByLatLon(lat, lon) {
+
+    /* ---------- SEAS (MORE SPECIFIC FIRST) ---------- */
+
+    // Arabian Sea
+    if (lat >= 5 && lat <= 30 && lon >= 50 && lon <= 78)
+        return "Arabian Sea";
+
+    // Bay of Bengal
+    if (lat >= 5 && lat <= 22 && lon >= 80 && lon <= 100)
+        return "Bay of Bengal";
+
+    // Red Sea
+    if (lat >= 12 && lat <= 30 && lon >= 32 && lon <= 44)
+        return "Red Sea";
+
+    // Persian Gulf
+    if (lat >= 23 && lat <= 31 && lon >= 48 && lon <= 57)
+        return "Persian Gulf";
+
+    // South China Sea
+    if (lat >= -5 && lat <= 23 && lon >= 100 && lon <= 120)
+        return "South China Sea";
+
+    // Mediterranean Sea
+    if (lat >= 30 && lat <= 46 && lon >= -6 && lon <= 36)
+        return "Mediterranean Sea";
+
+    // Caribbean Sea
+    if (lat >= 9 && lat <= 23 && lon >= -90 && lon <= -60)
+        return "Caribbean Sea";
+
+    /* ---------- OCEANS (YOUR ORIGINAL LOGIC) ---------- */
+
     if (lat >= -60 && lat <= 60 && lon >= -180 && lon <= -100)
         return "Pacific Ocean";
+
     if (lat >= -60 && lat <= 60 && lon >= -100 && lon <= -20)
         return "Atlantic Ocean";
+
     if (lat >= -60 && lat <= 30 && lon >= 20 && lon <= 120)
         return "Indian Ocean";
+
     if (lat > 60)
         return "Arctic Ocean";
+
     if (lat < -60)
         return "Southern Ocean";
+
     return "Open Ocean";
 }
+
 
 async function getCachedUserPlace() {
     if (!cachedUserPlace && userLat != null && userLon != null) {
@@ -1170,33 +1240,82 @@ async function fetchLive() {
     });
 
     // update table
-    if (tableBody) {
-        tableBody.innerHTML = "";
-        quakes.forEach(q => {
-            const tr = document.createElement("tr");
-            if (q.magnitude >= 4) tr.style.background = "#f8d7da";
+const latestTbody = document.querySelector("#latestTable tbody");
+if (latestTbody) {
+    latestTbody.innerHTML = "";
 
-            tr.innerHTML = `
-                <td>${q.lat}</td>
-                <td>${q.lon}</td>
-                <td>${q.depth}</td>
-                <td>${q.magnitude}</td>
-                <td>${q.place}</td>
-                <td>${q.time}</td>
-            `;
-            tableBody.appendChild(tr);
-        });
-    }
+    quakes.forEach(q => {
+        const tr = document.createElement("tr");
+        if (q.magnitude >= 4) tr.style.background = "#f8d7da";
+
+        tr.innerHTML = `
+            <td>${q.lat}</td>
+            <td>${q.lon}</td>
+            <td>${q.depth}</td>
+            <td>${q.magnitude}</td>
+            <td>${q.magnitude >= 4 ? "Yes" : "No"}</td>
+            <td>${q.time}</td>
+        `;
+        latestTbody.appendChild(tr);
+    });
+}
 
     // early warning
-    if (nearest && nearest.magnitude >= 4 && distance <= 50) {
-        earlyWarning(nearest, distance);
-        eqHead.textContent = "⚠ Strong Earthquake Nearby!";
-        eqHead.className = "text-danger fw-bold";
-    } else {
-        eqHead.textContent = "No Strong Earthquake Nearby";
-        eqHead.className = "text-success fw-bold";
+    // early warning + voice
+if (nearest && nearest.magnitude >= 4 && distance <= 50) {
+    earlyWarning(nearest, distance);
+    eqHead.textContent = "⚠ Strong Earthquake Nearby!";
+    eqHead.className = "text-danger fw-bold";
+
+    speakStatus("Warning. Strong earthquake nearby. Stay alert.");
+
+} else {
+    eqHead.textContent = "No Strong Earthquake Nearby";
+    eqHead.className = "text-success fw-bold";
+
+    speakStatus("No strong earthquake nearby. You are safe.");
+}
+
+/* =========================
+   RISK LEVEL (FRONTEND)
+========================= */
+const riskEl = document.getElementById("riskLevelText");
+
+let riskLevel = "No Risk";
+let color = "gray";
+
+/* sirf meaningful earthquake pe risk dikhao */
+if (
+    nearest &&
+    nearest.magnitude != null &&
+    nearest.magnitude >= 3 &&   // 👈 IMPORTANT
+    distance != null &&
+    distance <= 300             // 👈 bahut door ho to ignore
+) {
+
+    if (nearest.magnitude >= 6 && distance <= 100) {
+        riskLevel = "Extreme";
+        color = "darkred";
     }
+    else if (nearest.magnitude >= 5 && distance <= 80) {
+        riskLevel = "High";
+        color = "red";
+    }
+    else if (nearest.magnitude >= 4 && distance <= 50) {
+        riskLevel = "Medium";
+        color = "orange";
+    }
+    else {
+        riskLevel = "Low";
+        color = "green";
+    }
+}
+
+riskEl.textContent = riskLevel;
+riskEl.style.color = color;
+riskEl.classList.remove("text-muted");
+
+
 }
 
 
@@ -1210,27 +1329,101 @@ setInterval(fetchLive,20000);
 /* ============================
    MANUAL FORM
 ============================ */
-document.getElementById("predictionForm")?.addEventListener("submit",e=>{
+document.getElementById("predictionForm")?.addEventListener("submit", async e => {
     e.preventDefault();
-    const manualMag=parseFloat(document.getElementById("inputMag").value);
-    const manualLat=parseFloat(document.getElementById("inputLat").value);
-    const manualLon=parseFloat(document.getElementById("inputLon").value);
 
+    const manualMag   = parseFloat(document.getElementById("inputMag").value);
+    const manualLat   = parseFloat(document.getElementById("inputLat").value);
+    const manualLon   = parseFloat(document.getElementById("inputLon").value);
+    const manualDepth = parseFloat(document.getElementById("inputDepth")?.value || 0);
 
+    if (isNaN(manualLat) || isNaN(manualLon)) {
+        alert("Invalid latitude or longitude");
+        return;
+    }
+
+    /* ✅ UPDATE GLOBAL USER LOCATION */
+    userLat = manualLat;
+    userLon = manualLon;
+    userDepth = manualDepth;
+    userDate = new Date().toUTCString();
+
+    /* ✅ PUSH MANUAL QUAKE */
     manualQuakes.push({
-        lat:manualLat,
-        lon:manualLon,
-        depth:manualDepth,
-        magnitude:manualMag,
-        place:"Manual Input",
-        time: f.properties.time
-      ? new Date(f.properties.time).toUTCString()
-      : "Unknown"
-
+        lat: manualLat,
+        lon: manualLon,
+        depth: manualDepth,
+        magnitude: manualMag || 0,
+        place: "Manual Input",
+        time: userDate
     });
 
+    /* ✅ SEND TO BACKEND (DB UPDATE) */
+    const res = await fetch("/update_user_location", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            latitude: manualLat,
+            longitude: manualLon,
+            depth: manualDepth
+        })
+    });
+
+    const data = await res.json();
+    if (data.status !== "ok") {
+        alert("Failed to update location");
+        return;
+    }
+
+    /* ✅ REFRESH MAP VIEW */
+    map.setView([userLat, userLon], 6);
     fetchLive();
+
+    /* ✅ REFRESH TABLE IMMEDIATELY */
+    updateLatestTable(data.row);
 });
+
+
+function populateVoiceList() {
+    const voiceSelect = document.getElementById("voiceSelect");
+    if (!voiceSelect) return;   // 🔒 SAFETY
+
+    voiceSelect.innerHTML = "";
+
+    const voices = speechSynthesis.getVoices();
+    voices.forEach((voice, i) => {
+        const opt = document.createElement("option");
+        opt.value = i;
+        opt.textContent = voice.name;
+        voiceSelect.appendChild(opt);
+    });
+
+    voiceSelect.selectedIndex = 0;
+}
+window.addEventListener("DOMContentLoaded", populateVoiceList);
+speechSynthesis.onvoiceschanged = populateVoiceList;
+
+
+function updateLatestTable(row) {
+    const tbody = document.querySelector("#latestTable tbody");
+    if (!tbody || !row) return;
+
+    let tr = tbody.querySelector(`tr[data-user-id='${row.id}']`);
+    if (!tr) {
+        tr = document.createElement("tr");
+        tr.setAttribute("data-user-id", row.id);
+        tbody.prepend(tr); // latest on top
+    }
+
+    tr.innerHTML = `
+        <td>${row.lat}</td>
+        <td>${row.lon}</td>
+        <td>${row.depth}</td>
+        <td>${row.magnitude}</td>
+        <td>${row.alert}</td>
+        <td>${row.date}</td>
+    `;
+}
 
       function confirmLogout() {
     return confirm("Are you sure you want to logout?");

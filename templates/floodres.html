@@ -283,6 +283,29 @@ footer{
   }
 
   #map{ height:350px; }
+  #river_dam_heading,
+#river_dam_status {
+    text-align: center;
+    margin: 6px 0;
+}
+/* Custom heading style */
+#river_dam_heading.river-heading {
+    font-size: 2.5rem;       /* Bada font size */
+    line-height: 1.3;        /* Thoda tight line height */
+    margin-bottom: 0.5rem;   /* Paragraph ke liye gap */
+}
+
+#river_dam_status.river-status {
+    font-size: 1.2rem;       /* Status text thoda bada */
+    color: #28a745;          /* Green color for safe */
+}
+
+.cyclone-text {
+    font-size: 22px;       /* 👈 yahin se text bada hoga */
+    font-weight: 700;
+    line-height: 1.4;
+}
+
 }
 </style>
 
@@ -436,9 +459,11 @@ footer{
         {% if predictions %}
           {% set pred_value = predictions[0][0] %}
           {% set flood_status = predictions[0][1] %}
+           {% set rainfall = predictions[0][2] %}
+         {% set snow_melt = predictions[0][3] %}
 
 <h3 id="live_flood_heading"
-    class="fw-bold
+    class="fw-bold fs-4
       {% if flood_status == 'Flood Predicted' or flood_status == 'Real Flood Detected' %}
          text-danger
       {% else %}
@@ -452,6 +477,7 @@ footer{
           <p class="text-secondary mt-2">
             <b>Predicted River Level:</b> {{ pred_value }} m <br>
             <b>Entered Rainfall:</b> {{ rainfall_input }} mm <br>
+             <b>Snow Melt:</b> {{ snow_melt }} mm <br>
             <b>Timestamp:</b> {{ timestamp }}
           </p>
 
@@ -475,6 +501,9 @@ footer{
 
 </form>
 
+
+</form>
+
           {% endif %}
 
         {% else %}
@@ -482,16 +511,29 @@ footer{
         {% endif %}
       </div>
           <!-- Real-Time Weather -->
-          <div class="border-top pt-3">
-            <h5 class="text-primary mb-2 text-center">🌍 Real-Time Weather & Flood Risk</h5>
-            <div class="text-center">
-              <p id="timestamp" class="text-secondary small"></p>
-              <p id="location" class="fw-semibold">Fetching your location...</p>
-              <p id="weather">Loading weather data...</p>
-              <p id="rainfall">Rainfall: --</p>
-              <h5 id="risk" class="fw-bold text-secondary">Calculating flood risk...</h5>
-            </div>
-          </div>
+<div class="border-top pt-3 mb-4">
+    <h5 class="text-primary mb-2 text-center fs-5">🌍 Real-Time Weather & Flood Risk</h5>
+    <div class="text-center">
+      <p id="timestamp" class="text-secondary small mb-1"></p>
+      <p id="location" class="fw-semibold mb-1">Fetching your location...</p>
+      <p id="weather" class="mb-1">Loading weather data...</p>
+      <p id="rainfall" class="mb-2">Rainfall: --</p>
+      <h5 id="risk" class="fw-bold text-secondary">Calculating flood risk...</h5>
+    </div>
+<div id="cycloneInfo" class="text-center fw-semibold mt-2 cyclone-text">
+    Checking cyclone conditions...
+</div>
+
+
+</div>
+
+
+<div class="text-center mb-5 pt-3"> <!-- mb-5 adds more bottom spacing; pt-3 top padding -->
+  <h2 id="river_dam_heading" class="fw-bold text-secondary river-heading mb-2">
+    🏞️ River & Dam Status: Loading...
+  </h2>
+  <p id="river_dam_status" class="river-status">—</p>
+</div>
 
           <!-- Map -->
           <div class="mt-4">
@@ -517,7 +559,7 @@ footer{
     </div>
 
     <!-- Footer -->
-
+<div id="debug" style="background:#f5f5f5; border:1px solid #ccc; padding:10px; margin:10px 0;"></div>
 
   </div>
 </div>
@@ -540,13 +582,22 @@ footer{
 <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
 <script>
 const apiKey = "fb116bebc392ccc8ab251927edcb55d6";
+let firstLoad = true;
+let riverCircle = null;
+let actualRiverName = null;
+let riverNameCache = {
+    key: null,   // "lat,lon"
+    name: null
+};
+
 
 /* ---------------- SERVER DATA ---------------- */
 const serverLat = {{ lat|tojson if lat else 'null' }};
 const serverLon = {{ lon|tojson if lon else 'null' }};
 const serverRainfall = {{ rainfall_amt|tojson if rainfall_amt else 'null' }};
+const serverSnowMelt = {{ snow_melt|tojson }};
 const serverFloodStatus = "{{ flood_status }}";
-
+let serverLocation = null;
 /* ---------------- UI LOADING STATE ---------------- */
 function setLoadingState() {
     document.getElementById("live_flood_heading").innerText = "Loading flood data...";
@@ -598,7 +649,406 @@ L.control.layers({}, {
 
 let marker;
 
-/* ---------------- HELPERS ---------------- */
+
+/*************************
+ * LOADING STATE
+ *************************/
+/*************************
+ * LOADING PLACEHOLDER
+ *************************/
+function setRiverDamLoading() {
+    const h = document.getElementById("river_dam_heading");
+    const p = document.getElementById("river_dam_status");
+
+    if (!h || !p) return;
+
+    h.innerText = "Loading River / Dam Data...";
+    h.className = "fw-bold text-info";
+
+    p.innerHTML = "⏳ Fetching real-time river, discharge & level...";
+    p.style.textAlign = "center";
+}
+
+/*************************
+ * REAL-TIME RIVER LEVEL
+ *************************/
+function calculateRiverLevel(discharge, riverType = "medium") {
+    if (discharge === null || discharge === undefined) return null;
+
+    let a, b, bedLevel;
+
+    if (riverType === "small") {
+        a = 0.20;
+        b = 0.50;
+        bedLevel = 0.30;
+    }
+    else if (riverType === "large") {
+        a = 0.15;
+        b = 0.42;
+        bedLevel = 1.20;
+    }
+    else { // medium
+        a = 0.25;
+        b = 0.45;
+        bedLevel = 0.60;
+    }
+
+    if (discharge <= 0) return Number(bedLevel.toFixed(2));
+
+    let level = bedLevel + a * Math.pow(discharge, b);
+
+    // realistic clamp
+    level = Math.max(bedLevel, Math.min(level, 25));
+
+    return Number(level.toFixed(2));
+}
+
+
+/*************************
+ * CHECK NON-ENGLISH TEXT
+ *************************/
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a =
+    Math.sin(dLat/2) ** 2 +
+    Math.cos(lat1 * Math.PI/180) *
+    Math.cos(lat2 * Math.PI/180) *
+    Math.sin(dLon/2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+const OVERPASS_SERVERS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://overpass.nchc.org.tw/api/interpreter"
+];
+
+
+
+
+
+async function fetchRiverName(lat, lon) {
+
+  const radii = [8000, 15000, 30000];
+
+  for (const radius of radii) {
+
+    for (const server of OVERPASS_SERVERS) {
+
+      try {
+        const query = `[out:json][timeout:10];
+        (
+          way(around:${radius},${lat},${lon})[waterway~"river|stream|canal|waterfall"];
+          relation(around:${radius},${lat},${lon})[waterway~"river|stream|canal|waterfall"];
+          way(around:${radius},${lat},${lon})[natural=water];
+          relation(around:${radius},${lat},${lon})[natural=water];
+        );
+        out tags center;`;
+
+        const res = await fetch(
+          server + "?data=" + encodeURIComponent(query)
+        );
+
+        const data = await res.json();
+
+        let best = null;
+
+        data?.elements?.forEach(el => {
+          const name = el.tags?.name;
+          if (!name) return;
+
+          const elLat = el.center?.lat ?? el.lat;
+          const elLon = el.center?.lon ?? el.lon;
+          if (!elLat || !elLon) return;
+
+          const dist = haversine(lat, lon, elLat, elLon);
+
+          const typePriority = el.tags.waterway
+            ? ["river", "stream", "canal", "waterfall"].indexOf(el.tags.waterway)
+            : 5;
+
+          if (
+            !best ||
+            typePriority < best.typePriority ||
+            (typePriority === best.typePriority && dist < best.dist)
+          ) {
+            best = { name, dist, typePriority };
+          }
+        });
+
+        if (best) return best.name;
+
+      } catch (_) {
+        // try next server
+      }
+    }
+  }
+  return null;
+}
+
+async function fetchSeaName(lat, lon) {
+
+  for (const server of OVERPASS_SERVERS) {
+    try {
+      const query = `[out:json][timeout:6];
+      (
+        node(around:80000,${lat},${lon})[place=sea];
+        relation(around:80000,${lat},${lon})[place=sea];
+      );
+      out tags center;`;
+
+      const res = await fetch(server + "?data=" + encodeURIComponent(query));
+      if (!res.ok) continue;
+
+      const data = await res.json();
+
+      let best = null;
+
+      data?.elements?.forEach(el => {
+        if (!el.tags?.name) return;
+
+        const elLat = el.center?.lat ?? el.lat;
+        const elLon = el.center?.lon ?? el.lon;
+        if (!elLat || !elLon) return;
+
+        const dist = haversine(lat, lon, elLat, elLon);
+        if (!best || dist < best.dist) {
+          best = { name: el.tags.name, dist };
+        }
+      });
+
+      if (best) return best.name;
+
+    } catch (_) {}
+  }
+  return null;
+}
+
+function fetchWaterFallback(lat, lon) {
+    return new Promise(resolve => {
+        const query = `[out:json][timeout:6];
+        (
+          way(around:8000, ${lat}, ${lon})[natural=water];
+          relation(around:8000, ${lat}, ${lon})[natural=water];
+          way(around:8000, ${lat}, ${lon})[waterway~"river|stream|canal|waterfall"];
+          relation(around:8000, ${lat}, ${lon})[waterway~"river|stream|canal|waterfall"];
+        );
+        out tags center;`;
+
+        fetch("https://overpass-api.de/api/interpreter?data=" + encodeURIComponent(query))
+            .then(r => r.json())
+            .then(data => {
+                let best = null;
+                let minDist = Infinity;
+
+                if (data?.elements?.length) {
+                    data.elements.forEach(el => {
+                        const name = el.tags?.name;
+                        if (!name) return;
+
+                        const elLat = el.center?.lat ?? el.lat ?? 0;
+                        const elLon = el.center?.lon ?? el.lon ?? 0;
+                        const d = Math.hypot(lat - elLat, lon - elLon);
+
+                        // 🔹 PRIORITY ORDER
+                        const typePriority = el.tags.waterway
+                            ? ["river", "stream", "canal", "waterfall"].indexOf(el.tags.waterway)
+                            : 5; // natural water fallback
+
+                        if (!best || typePriority < best.typePriority || (typePriority === best.typePriority && d < best.dist)) {
+                            best = { el, typePriority, dist: d };
+                        }
+                    });
+                }
+
+                resolve(best?.el?.tags?.name || null);
+            })
+            .catch(() => resolve(null));
+    });
+}
+
+
+
+/*************************
+ * FETCH RIVER/DAM DATA
+ *************************/
+function fetchRiverDamGlobal(lat, lon, callback) {
+
+  fetch(`https://flood-api.open-meteo.com/v1/flood?latitude=${lat}&longitude=${lon}&daily=river_discharge&timezone=auto`)
+    .then(res => res.json())
+    .then(async data => {
+
+      const discharge = data.daily?.river_discharge?.[0] ?? 0;
+      const riverLevel = calculateRiverLevel(discharge);
+
+      if (discharge === 0) {
+        callback({
+          riverLevel: 0,
+          discharge: 0,
+          riverName: "No River Found"
+        });
+        return;
+      }
+
+let name = await fetchRiverName(lat, lon);
+
+// 🌊 Agar river ka naam nahi mila
+if (!name) {
+  const seaName = await fetchSeaName(lat, lon);
+  if (seaName) {
+    name = seaName + " (Sea)";
+  }
+}
+
+callback({
+  riverLevel,
+  discharge,
+  riverName: name || "Neareast Water Body"
+});
+
+    })
+    .catch(() => {
+      callback({
+        riverLevel: 0,
+        discharge: 0,
+        riverName: "No River Found"
+      });
+    });
+}
+
+
+
+
+function getFloodSpreadKm(discharge) {
+    if (discharge > 8000) return 20;
+    if (discharge > 6000) return 12;
+    if (discharge > 4000) return 8;
+    if (discharge > 2000) return 5;
+    if (discharge > 1000) return 2;
+    return 0;
+}
+
+
+
+
+/*************************
+ * DRAW RIVER STATUS ON MAP
+ *************************/
+function drawRiverStatusOnMap(lat, lon, riverLevel, discharge, riverName) {
+
+    if (riverName === "No River Found" || discharge === 0) {
+        if (riverCircle) {
+            map.removeLayer(riverCircle);
+            riverCircle = null;
+        }
+        return;
+    }
+
+    const color = getRiverColor(riverLevel, discharge);
+    const spreadKm = getFloodSpreadKm(discharge);
+
+    if (riverCircle) map.removeLayer(riverCircle);
+
+    riverCircle = L.circle([lat, lon], {
+        radius: spreadKm > 0 ? spreadKm * 1000 : 12000,
+        color,
+        fillColor: color,
+        fillOpacity: 0.25
+    })
+    .addTo(map)
+    .bindPopup(`
+        <b>River / Dam Status</b><br>
+        🌊 <b>${riverName}</b><br>
+        🌍 Discharge: ${discharge.toFixed(2)} m³/s<br>
+        📊 Level: ${riverLevel.toFixed(2)} m<br>
+        ${
+            spreadKm > 0
+            ? `🚨 Possible flood spread: <b>${spreadKm} km</b>`
+            : `🟢 Flood spread: <b>Negligible</b>`
+        }
+    `);
+}
+
+
+
+/*************************
+ * STATUS LOGIC
+ *************************/
+function getRiverDamStatus(riverLevel, discharge) {
+    if (riverLevel >= 7 || discharge >= 7000) {
+        return {
+            heading: " River / Dam Flood Detected",
+            text: "Very High Risk – River overflow or dam release",
+            color: "text-danger",
+            voice: "Warning. River flood detected.",
+            markerColor: "red"
+        };
+    } else if (riverLevel >= 6 || discharge >= 5000) {
+        return {
+            heading: " River / Dam Warning",
+            text: "Moderate risk – Stay alert",
+            color: "text-warning",
+            voice: "River level rising. Stay alert.",
+            markerColor: "orange"
+        };
+    } else {
+        return {
+            heading: " River & Dam Safe",
+            text: "No river or dam flood risk",
+            color: "text-success",
+            voice: "",
+            markerColor: "blue"
+        };
+    }
+}
+
+function getRiverColor(riverLevel, discharge) {
+    return getRiverDamStatus(riverLevel, discharge).markerColor;
+}
+
+/*************************
+ * UPDATE FRONTEND RIVER UI
+ *************************/
+function updateRiverUI(lat, lon) {
+    setRiverDamLoading();
+
+    fetchRiverDamGlobal(lat, lon, riverData => {
+        const level = riverData.riverLevel;
+        const discharge = riverData.discharge;
+        const riverName = riverData.riverName;
+
+        const riverStatus = getRiverDamStatus(level, discharge);
+
+        const h = document.getElementById("river_dam_heading");
+        const p = document.getElementById("river_dam_status");
+        if (!h || !p) return;
+
+        h.innerText = riverStatus.heading;
+        h.className = "fw-bold " + riverStatus.color;
+
+        const spreadKm = getFloodSpreadKm(discharge);
+
+        p.innerHTML = `
+            🌊 River: <b>${riverName}</b><br>
+            ${riverStatus.text}<br>
+            🌍 Global River Discharge: ${discharge.toFixed(2)} m³/s<br>
+            📊 Real-Time River Level: ${level.toFixed(2)} m<br>
+            ${
+                spreadKm > 0
+                ? `🚨 Possible Flood Spread: <b>${spreadKm} km</b>`
+                : `🟢 Flood Spread: <b>Negligible</b>`
+            }
+        `;
+        p.style.textAlign = "center";
+
+        drawRiverStatusOnMap(lat, lon, level, discharge, riverName);
+    });
+}
+
+
+
 function validCoords(lat, lon) {
     return lat !== null && lon !== null &&
            !isNaN(lat) && !isNaN(lon) &&
@@ -606,17 +1056,134 @@ function validCoords(lat, lon) {
            lon >= -180 && lon <= 180;
 }
 
-function getFloodStatus(precipitation) {
-    if (precipitation > 30)
-        return { heading: "Real Flood Detected", riskText: "🚨 Flood Risk: Very High", colorClass: "text-danger", markerColor: "red" };
-    else if (precipitation > 20)
-        return { heading: "Flood Warning", riskText: "⚠️ Flood Risk: Moderate", colorClass: "text-warning", markerColor: "orange" };
-    else if (precipitation > 5)
-        return { heading: "Low Risk", riskText: "🟡 Flood Risk: Low", colorClass: "text-info", markerColor: "yellow" };
-    else
-        return { heading: "No Flood", riskText: "✅ Flood Risk: None", colorClass: "text-success", markerColor: "green" };
+
+// -------------------- AMBEE CYCLONE FETCH FUNCTION --------------------
+function getFloodStatus(
+    precipitation,
+    snowMelt = 0,
+    cycloneDetected = false,
+    windSpeed = 0,
+    isCoastal = false
+) {
+    const totalWater = precipitation + snowMelt;
+    const snowHeavy = snowMelt >= 5 && snowMelt > precipitation;
+
+    const cycloneStrong = windSpeed >= 62;
+    const cycloneSevere = windSpeed >= 89;
+
+    // 🚨 REAL FLOOD
+    if (
+        totalWater >= 30 ||
+        (cycloneSevere && isCoastal && totalWater >= 1) ||
+        (cycloneStrong && totalWater >= 20)
+    ) {
+        return {
+            heading: "Real Flood Detected",
+            riskText: cycloneSevere
+                ? "🚨 Extreme Flood Risk (Severe Cyclone + Storm Surge)"
+                : cycloneStrong
+                    ? "🚨 High Flood Risk (Cyclone + Heavy Rain)"
+                    : snowHeavy
+                        ? "🚨 High Flood Risk (Snow Melt)"
+                        : "🚨 High Flood Risk (Heavy Rainfall)",
+            voice: "Danger. Flood conditions detected. Move to a safe location.",
+            colorClass: "text-danger",
+            markerColor: "red"
+        };
+    }
+
+    // 🟦 CYCLONE ONLY (COASTAL — NO RAIN)
+    if (cycloneDetected && cycloneStrong && totalWater === 0 && isCoastal) {
+        return {
+            heading: "No Flood Yet",
+            riskText: "🟦 Cyclone Present – Storm Surge Possible on Coast",
+            voice: "Cyclone winds detected. Coastal storm surge possible.",
+            colorClass: "text-primary",
+            markerColor: "blue"
+        };
+    }
+
+    // ⚠️ FLOOD WARNING (WITH REASON)
+    if (
+        totalWater >= 15 ||
+        (cycloneStrong && totalWater >= 5)
+    ) {
+
+        let reason = "";
+
+        if (cycloneStrong && totalWater >= 5 && isCoastal) {
+            reason = "⚠️ Moderate Flood Risk (Cyclone Winds + Rainfall)";
+        } else if (cycloneStrong && totalWater >= 5) {
+            reason = "⚠️ Moderate Flood Risk (Cyclone Influence)";
+        } else if (snowHeavy) {
+            reason = "⚠️ Moderate Flood Risk (Snow Melt)";
+        } else {
+            reason = "⚠️ Moderate Flood Risk (Moderate Rainfall)";
+        }
+
+        return {
+            heading: "Flood Warning",
+            riskText: reason,
+            voice: "Flood warning issued. Stay alert.",
+            colorClass: "text-warning",
+            markerColor: "orange"
+        };
+    }
+
+    // 🟡 LOW RISK (WITH REASON)
+    if (totalWater >= 5) {
+        return {
+            heading: "Low Flood Risk",
+            riskText: snowHeavy
+                ? "🟡 Low Flood Risk (Minor Snow Melt)"
+                : "🟡 Low Flood Risk (Light Rainfall)",
+            voice: "Low flood risk detected.",
+            colorClass: "text-info",
+            markerColor: "yellow"
+        };
+    }
+
+    // 🟢 SAFE (WITH CONTEXT)
+    return {
+        heading: "No Flood",
+        riskText: cycloneDetected
+            ? "🟢 No Flood Yet (Cyclone Present, No Heavy Rain)"
+            : "🟢 Flood Risk: None",
+        voice: "No flood detected. Area is safe.",
+        colorClass: "text-success",
+        markerColor: "green"
+    };
 }
+
+let lastRequestId = 0;
+
 function getGuaranteedWaterName(lat, lon) {
+
+    /* ---------- SEAS (HIGH PRIORITY) ---------- */
+
+    if (lat >= 5 && lat <= 30 && lon >= 50 && lon <= 78)
+        return "Arabian Sea";
+
+    if (lat >= 5 && lat <= 22 && lon >= 80 && lon <= 100)
+        return "Bay of Bengal";
+
+    if (lat >= 12 && lat <= 30 && lon >= 32 && lon <= 44)
+        return "Red Sea";
+
+    if (lat >= 23 && lat <= 31 && lon >= 48 && lon <= 57)
+        return "Persian Gulf";
+
+    if (lat >= 30 && lat <= 46 && lon >= -6 && lon <= 36)
+        return "Mediterranean Sea";
+
+    if (lat >= -5 && lat <= 23 && lon >= 100 && lon <= 120)
+        return "South China Sea";
+
+    if (lat >= 9 && lat <= 23 && lon >= -90 && lon <= -60)
+        return "Caribbean Sea";
+
+    /* ---------- OCEANS ---------- */
+
     if (lat > 60) return "Arctic Ocean";
     if (lat < -60) return "Southern Ocean";
 
@@ -628,6 +1195,14 @@ function getGuaranteedWaterName(lat, lon) {
 }
 
 function fetchLocationName(lat, lon) {
+
+    const requestId = ++lastRequestId;
+
+    // ⏳ Show loading instead of wrong sea
+    document.getElementById("location").innerHTML =
+        `⏳ Detecting location...<br>
+         <small>Lat: ${lat.toFixed(6)}, Lon: ${lon.toFixed(6)}</small>`;
+
     fetch(
         `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1&email=test@example.com`
     )
@@ -636,18 +1211,31 @@ function fetchLocationName(lat, lon) {
         return res.json();
     })
     .then(data => {
+ serverLocation = data;
+        // ❌ Ignore old responses
+        if (requestId !== lastRequestId) return;
+
         const addr = data.address || {};
 
         /* ======================
-           ✅ FORCE LAND DETECTION
+           🇮🇳 FORCE INDIA LAND
            ====================== */
-        const isLand =
-            data.display_name &&               // Nominatim found a place
-            data.class !== "water" &&           // not water object
+        const isIndiaLand =
+            addr.country === "India" &&
             !addr.ocean &&
             !addr.sea;
 
-        if (isLand) {
+        /* ======================
+           ✅ LAND DETECTION
+           ====================== */
+        const isLand =
+            data.display_name &&
+            data.class !== "water" &&
+            !addr.ocean &&
+            !addr.sea;
+
+        if (isIndiaLand || isLand) {
+
             const place =
                 addr.suburb ||
                 addr.neighbourhood ||
@@ -666,7 +1254,7 @@ function fetchLocationName(lat, lon) {
         }
 
         /* ======================
-           🌊 EXPLICIT SEA / OCEAN
+           🌊 SEA / OCEAN (API)
            ====================== */
         if (addr.sea || addr.ocean) {
             document.getElementById("location").innerHTML =
@@ -676,20 +1264,21 @@ function fetchLocationName(lat, lon) {
         }
 
         /* ======================
-           🌍 TRUE OCEAN FALLBACK
+           🌍 FALLBACK (LAST ONLY)
            ====================== */
         document.getElementById("location").innerHTML =
             `🌍 ${getGuaranteedWaterName(lat, lon)}<br>
              <small>Lat: ${lat.toFixed(6)}, Lon: ${lon.toFixed(6)}</small>`;
     })
     .catch(() => {
+
+        if (requestId !== lastRequestId) return;
+
         document.getElementById("location").innerHTML =
             `🌍 ${getGuaranteedWaterName(lat, lon)}<br>
              <small>Lat: ${lat.toFixed(6)}, Lon: ${lon.toFixed(6)}</small>`;
     });
 }
-
-
 
 
 /* ---------------- WEATHER + FLOOD LOGIC ---------------- */
@@ -704,20 +1293,91 @@ function fetchWeather(lat, lon, callback=null) {
             const humidity = data.main?.humidity ?? 0;
             const rain = data.rain?.["1h"] ?? data.rain?.["3h"] ?? 0;
             const snow = data.snow?.["1h"] ?? data.snow?.["3h"] ?? 0;
+            const windSpeed = (data.wind?.speed ?? 0) * 3.6;
 
-            const precipitation = (rain + snow) || (serverRainfall ?? 0);
-            const status = getFloodStatus(precipitation);
+// Pressure (hPa)
+const pressure = data.main?.pressure ?? 1013;
+
+// Cyclone condition (meteorological)
+const cycloneDetected =
+    windSpeed >= 62 ||     // ≥ 62 km/h (Tropical storm)
+    pressure <= 990;
+const isCoastal =
+    !!(serverLocation?.address?.sea || serverLocation?.address?.ocean);
+
+const precipitation = (rain + snow) || (serverRainfall ?? 0);
+
+
+
+// ❄️ SCIENTIFIC SNOW MELT LOGIC
+let snowMelt = 0;
+
+
+// Degree-day simple melt model
+if (temp > 0 && snow > 0) {
+    const meltFactor = 0.1; // 10% of snowfall melts per °C
+    snowMelt = +(snow * temp * meltFactor).toFixed(2);
+}
+
+
+let status = getFloodStatus(
+    precipitation,
+    snowMelt,
+    cycloneDetected,
+    windSpeed,
+    isCoastal      // ✅ ONLY MISSING PIECE
+);
+
+
+
+
+
+// Cyclone UI
+const cycloneEl = document.getElementById("cycloneInfo");
+
+// 🔹 Heading sirf cyclone ke liye
+const cycloneHeading = cycloneDetected
+    ? `<span style="font-size:15px; font-weight:600; color:#0d6efd;">
+          🌪️ Cyclonic system influencing weather
+       </span>`
+    : `<span style="font-size:15px; font-weight:600; color:green;">
+          No cyclonic influence
+       </span>`;
+
+// 🔹 Wind & pressure hamesha visible
+cycloneEl.innerHTML = `
+    ${cycloneHeading}<br>
+
+    <span style="font-size:16px; color:#333;">
+        💨 Wind: ${windSpeed.toFixed(1)} km/h
+    </span><br>
+
+    <span style="font-size:16px; color:#333;">
+        ⬇️ Pressure: ${pressure} hPa
+    </span>
+`;
+
+
+
+
+if (firstLoad || window.lastSpokenStatus !== status.heading) {
+    speakFloodStatus(status.voice || status.heading);
+    window.lastSpokenStatus = status.heading;
+    firstLoad = false;
+}
 
             if (!callback) {
-                const head = document.getElementById("live_flood_heading");
-                head.innerText = status.heading;
-                head.className = `fw-bold ${status.colorClass}`;
+const head = document.getElementById("live_flood_heading");
+head.innerText = status.heading;
+head.className = `fw-bold ${status.colorClass}`;
+head.style.fontSize = "1.9rem";   // 🔥 clearly bigger, not oversized
+
 
                 document.getElementById("weather").innerText =
                     `🌦️ ${weatherDesc}, 🌡️ ${temp}°C, 💧 ${humidity}%`;
 
-                document.getElementById("rainfall").innerText =
-                    `🌧️ Precipitation (last hour): ${precipitation} mm`;
+ document.getElementById("rainfall").innerText =
+        `🌧️ Precipitation (last hour): ${precipitation} mm, ❄️ Snow Melt: ${snowMelt ?? 0} mm`;
 
                 document.getElementById("timestamp").innerText =
                     `🕒 ${new Date().toLocaleString()}`;
@@ -725,6 +1385,7 @@ function fetchWeather(lat, lon, callback=null) {
                 const risk = document.getElementById("risk");
                 risk.innerText = `Real-Time Status: ${status.riskText}`;
                 risk.className = `fw-bold ${status.colorClass}`;
+
 
                 fetchLocationName(lat, lon);
 
@@ -748,12 +1409,63 @@ function fetchWeather(lat, lon, callback=null) {
                         🌡️ ${temp}°C<br>
                         💧 ${humidity}%<br>
                         🌧️ ${precipitation} mm
+                        ❄️ Snow Melt: ${snowMelt ?? 0} mm
+
+
                     `)
                     .openPopup();
 
                 map.setView([lat, lon], 12);
+                // 🌊 RIVER & DAM STATUS (SEPARATE FROM RAIN)
+// 🌊 RIVER & DAM STATUS (WORLDWIDE – SEPARATE FROM RAIN)
+fetchRiverDamGlobal(lat, lon, river => {
+
+    const level = river.riverLevel;
+    const discharge = river.discharge;
+    const riverName = river.riverName;
+
+    const riverStatus = getRiverDamStatus(level, discharge);
+
+    const h = document.getElementById("river_dam_heading");
+    const p = document.getElementById("river_dam_status");
+
+    if (!h || !p) return;
+
+    h.innerText = riverStatus.heading;
+    h.className = "fw-bold " + riverStatus.color;
+
+    const spreadKm = getFloodSpreadKm(discharge);
+
+    p.innerHTML = `
+        ${riverStatus.text}<br>
+        🌊 <b>River:</b> ${riverName}<br>
+        🌍 Global River Discharge: ${discharge.toFixed(2)} m³/s
+        ${level !== null ? `<br>📊 Real-Time River Level: ${level.toFixed(2)} m` : ''}
+        <br>
+        ${
+            spreadKm > 0
+            ? `🚨 <b>Possible Flood Spread:</b> ${spreadKm} km`
+            : `🟢 <b>Flood Spread:</b> Negligible`
+        }
+    `;
+
+    p.style.textAlign = "center";
+
+    // 🗺️ Map drawing
+    drawRiverStatusOnMap(lat, lon, level, discharge, riverName);
+
+
+
+    // 🔊 VOICE ONLY FOR RIVER / DAM
+    if (riverStatus.voice) {
+        speakFloodStatus(riverStatus.voice);
+    }
+});
+
+
             } else {
-                callback({ weatherDesc, temp, humidity, precipitation, status });
+                callback({ weatherDesc, temp, humidity, precipitation, snowMelt, status });
+
             }
         })
         .catch(err => console.error(err));
@@ -772,13 +1484,18 @@ map.on("click", e => {
                 🌡️ ${data.temp}°C<br>
                 💧 ${data.humidity}%<br>
                 🌧️ ${data.precipitation} mm<br>
+                  ❄️ Snow Melt: ${data.snowMelt ?? 0} mm<br>
                 📍 Lat: ${lat.toFixed(6)}, Lon: ${lng.toFixed(6)}
             `)
             .openOn(map);
     });
 });
 
-/* ---------------- AUTO EXECUTION ---------------- */
+
+
+
+
+
 function updateFlood() {
     setLoadingState(); // 🔥 THIS IS THE FIX
 
@@ -792,10 +1509,25 @@ function updateFlood() {
             }
         );
     }
+       const floodRisk = getFloodStatus(serverRainfall, serverSnowMelt);
+    const riskEl = document.getElementById("risk");
+    if (riskEl) {
+        riskEl.innerText = `Real-Time Status: ${floodRisk.riskText}`;
+        riskEl.className = "fw-bold " + floodRisk.colorClass;
+    }
 }
+
+
 
 updateFlood();
 setInterval(updateFlood, 20000);
+
+// Flood / level update (OK to refresh)
+setInterval(() => {
+    updateRiverUI(serverLat, serverLon);
+}, 2 * 60 * 1000); // ⏱️ every 2 minutes
+
+
 
     function confirmLogout() {
     return confirm("Are you sure you want to logout?");
@@ -826,7 +1558,7 @@ if(localStorage.getItem("theme") === "dark"){
   icon.classList.add("fa-sun-o");
 }
 
-
+// 🚀 Flood Alert Form Submission with Real-Time River/Dam Data
 
   function confirmFloodAlert() {
     Swal.fire({
@@ -860,77 +1592,111 @@ function sendFloodAlert() {
         didOpen: () => Swal.showLoading()
     });
 
-    fetch(form.action, {
-        method: "POST",
-        body: formData
-    })
-    .then(res => res.json())
-    .then(data => {
+    const lat = parseFloat(formData.get("lat"));
+    const lon = parseFloat(formData.get("lon"));
 
-        console.log("FLOOD BACKEND RESPONSE:", data);
+    const precipitation = Number(formData.get("rainfall_amt")) || 0;
+    const snowMelt = Number(formData.get("snow_melt")) || 0;
 
-        // ✅ FINAL PLACE RESOLUTION (NO UNKNOWN)
-        const finalPlace =
-            data.detected_place &&
-            data.detected_place !== "Unknown" &&
-            data.detected_place !== "Unknown location"
-                ? data.detected_place
-                : getGuaranteedWaterName(data.lat, data.lon);
+    const floodStatus = getFloodStatus(precipitation, snowMelt);
 
-        // 🚨 NO USER REGISTERED
-        if (data.status === "no_users") {
-            Swal.fire({
-                title: "No Users Found",
-                html: `
-                    <p><b>No user is registered in this flood-affected area.</b></p>
-                    <hr>
-                    <p><b>Location</b></p>
-                    <p>Latitude: ${data.lat}</p>
-                    <p>Longitude: ${data.lon}</p>
-                    <p>Place: <b>${finalPlace}</b></p>
-                `,
-                icon: "error",
-                confirmButtonColor: "#dc2626"
-            });
-            return;
-        }
+    fetchRiverDamGlobal(lat, lon, river => {
+        const dischargeNum = river.discharge != null ? Number(river.discharge) : 0;
+        const levelNum = river.riverLevel != null ? Number(river.riverLevel) : 0;
 
-        // ❌ Other errors
-        if (data.status !== "success") {
-            Swal.fire({
-                title: "Error",
-                text: data.msg || "Failed to send flood alert",
-                icon: "error",
-                confirmButtonColor: "#dc2626"
-            });
-            return;
-        }
+        const riverStatus = getRiverDamStatus(levelNum, dischargeNum);
 
-        // ✅ SUCCESS
-        Swal.fire({
-            title: "Flood Alert Sent Successfully",
-            html: `
-                <p>${data.msg}</p>
-                <hr>
-                <p><b>Location</b></p>
+        // Set data to backend
+        formData.set("river_discharge", dischargeNum);
+        formData.set("river_level", levelNum);
+        formData.set("river_heading", riverStatus.heading);
+        formData.set("flood_heading", floodStatus.heading);
+        formData.set("flood_risk_text", floodStatus.riskText);
+
+        fetch(form.action, {
+            method: "POST",
+            body: formData
+        })
+        .then(res => res.json())
+        .then(data => {
+            const finalPlace =
+                data.detected_place && data.detected_place !== "Unknown" && data.detected_place !== "Unknown location"
+                    ? data.detected_place
+                    : getGuaranteedWaterName(data.lat, data.lon);
+
+            // Alerts sent / no user logic
+            let alertsText = data.alerts_sent && data.alerts_sent > 0
+                ? `<p><b>Alerts sent:</b> ${data.alerts_sent}</p>`
+                : `<p> No alerts sent (no users registered)</p>`;
+
+            let htmlContent = `
+
+                <p><b>Location:</b> ${finalPlace}</p>
                 <p>Latitude: ${data.lat}</p>
                 <p>Longitude: ${data.lon}</p>
-                <p>Place: <b>${finalPlace}</b></p>
-            `,
-            icon: "success",
-            confirmButtonColor: "#16a34a"
-        });
-    })
-    .catch(err => {
-        console.error("Flood Alert ERROR:", err);
-        Swal.fire({
-            title: "Server Error",
-            text: "Unable to send flood alert",
-            icon: "error",
-            confirmButtonColor: "#dc2626"
+                <hr>
+                <p><b>Rainfall:</b> ${precipitation} mm</p>
+                <p><b>Snow Melt:</b> ${snowMelt} mm</p>
+                <hr>
+                <p><b>River Discharge:</b> ${dischargeNum.toFixed(2)} m³/s</p>
+                <p><b>River Level:</b> ${levelNum.toFixed(2)} m</p>
+                <hr>
+                ${alertsText}
+            `;
+
+            let swalTitle = "Flood Alert Sent Successfully";
+            let iconType = "success";
+            let buttonColor = "#16a34a";
+
+            // ⚠️ If no user registered → red warning
+            if (!data.alerts_sent || data.alerts_sent === 0) {
+                swalTitle = "Warning: No Users Found";
+                iconType = "error"; // red
+                buttonColor = "#dc2626";
+            }
+
+            Swal.fire({
+                title: swalTitle,
+                html: htmlContent,
+                icon: iconType,
+                confirmButtonColor: buttonColor
+            });
+
+            // Map update
+            drawRiverStatusOnMap(lat, lon, levelNum, dischargeNum);
+
+            // Voice alert
+
+        })
+        .catch(err => {
+            console.error("Flood Alert ERROR:", err);
+            Swal.fire({
+                title: "Server Error",
+                text: "Unable to send flood alert",
+                icon: "error",
+                confirmButtonColor: "#dc2626"
+            });
         });
     });
 }
+
+
+  function speakFloodStatus(text) {
+    if (!("speechSynthesis" in window)) return;
+
+    // Purani awaaz band
+    window.speechSynthesis.cancel();
+
+    const msg = new SpeechSynthesisUtterance(text);
+    msg.lang = "en-IN";          // Indian English
+    msg.rate = 0.9;              // speed
+    msg.pitch = 1;
+    msg.volume = 1;
+
+    window.speechSynthesis.speak(msg);
+}
+// 🔊 VOICE ALERT
+speakFloodStatus(status.heading);
 
 </script>
 

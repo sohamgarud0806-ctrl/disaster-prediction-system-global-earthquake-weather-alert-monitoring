@@ -142,6 +142,10 @@ tbody tr:hover {
   <th>Longitude</th>
   <th>Temperature (°C)</th>
   <th>Precipitation (mm)</th>
+  <th>River Discharge (m³/s)</th>
+  <th>River Level (m)</th>
+  <th>River Status</th>
+  <th>Cyclone</th>
   <th>Weather</th>
   <th>Status</th>
   <th>Time</th>
@@ -172,9 +176,63 @@ async function loadUsers() {
     }
 }
 
+function calculateRiverLevel(discharge, riverType = "medium") {
+
+    const defaults = {
+        small: 0.35,
+        medium: 0.70,
+        large: 1.50
+    };
+
+    if (!discharge || discharge <= 0) {
+        return defaults[riverType] ?? 0.70;
+    }
+
+    const coeffMap = {
+        small:  { a: 0.18, b: 0.48, bed: 0.35 },
+        medium: { a: 0.22, b: 0.44, bed: 0.70 },
+        large:  { a: 0.14, b: 0.40, bed: 1.50 }
+    };
+
+    const { a, b, bed } = coeffMap[riverType] ?? coeffMap.medium;
+
+    let level = bed + a * Math.pow(discharge, b);
+
+    // Safety clamp
+    level = Math.max(bed, Math.min(level, 30));
+
+    return Number(level.toFixed(2));
+}
+
+async function fetchRiverDischarge(lat, lon) {
+    try {
+        const url = `https://flood-api.open-meteo.com/v1/flood?latitude=${lat}&longitude=${lon}&daily=river_discharge&timezone=auto`;
+        const res = await fetch(url);
+        const data = await res.json();
+
+        const discharge = data.daily?.river_discharge?.[0] ?? 0;
+        const level = calculateRiverLevel(discharge);
+
+        let status = "Safe";
+        if (level >= 7 || discharge >= 7000) status = "High Flood Risk";
+        else if (level >= 6 || discharge >= 5000) status = "Moderate Risk";
+
+        return {
+            discharge,   // ✅ NUMBER
+            level,       // ✅ NUMBER
+            status
+        };
+    } catch (e) {
+        return { discharge: 0, level: 0, status: "Unavailable" };
+    }
+}
+
+
+
 async function loadWeather() {
     const users = await loadUsers();
     const table = document.getElementById("weatherTable");
+
     table.innerHTML = "";
 
     // Remove old markers
@@ -185,6 +243,13 @@ async function loadWeather() {
         const url = `https://api.openweathermap.org/data/2.5/weather?lat=${u.lat}&lon=${u.lon}&appid=${apiKey}&units=metric`;
         const res = await fetch(url);
         const data = await res.json();
+        const windSpeed = (data.wind?.speed || 0) * 3.6; // m/s → km/h
+const pressure = data.main?.pressure || 1013;
+
+const cycloneDetected = (
+    windSpeed >= 62 || pressure <= 990
+);
+
 
         const temp = data.main.temp;
         const weather = data.weather[0].description;
@@ -200,33 +265,77 @@ async function loadWeather() {
                       status === "Moderate Risk" ? "orange" :
                       status === "Low Risk" ? "green" : "blue";
 
+const river = await fetchRiverDischarge(u.lat, u.lon);
+
         const marker = L.circleMarker([u.lat, u.lon], {
             color: color,
             fillColor: color,
             fillOpacity: 0.7,
             radius: 8
         }).addTo(map)
-          .bindPopup(`<b>${u.name}</b><br>Temp: ${temp}°C<br>Rain: ${precipitation} mm<br>Humidity: ${humidity}%<br>Status: ${status}`);
+          .bindPopup(`
+    <b>${u.name}</b><br>
+    🌡️ Temp: ${temp}°C<br>
+    🌧️ Rain: ${precipitation} mm<br>
+    💧 Humidity: ${humidity}%<br><br>
 
-        if (precipitation >= 0) marker._path.classList.add('blink');
+    <b>🌪 Cyclone Info</b><br>
+    💨 Wind: ${windSpeed.toFixed(1)} km/h<br>
+    ⬇️ Pressure: ${pressure} hPa<br>
+    Status: ${cycloneDetected ? 'Cyclonic Influence' : 'Normal'}<br><br>
+
+    <b>Flood Status:</b> ${status}
+`);
+
+        if (status === "High Risk" || cycloneDetected) {
+    marker._path.classList.add('blink');
+}
+
         markers[u.id] = marker;
 
-        table.innerHTML += `
-            <tr>
-                <td>${u.name}</td>
-                <td>${u.lat}</td>
-                <td>${u.lon}</td>
-                <td>${temp}</td>
-                <td>${precipitation}</td>
-                <td>${weather}</td>
-                <td>${status}</td>
-                <td>${time}</td>
-                <td>
-                    <button class="btn btn-warning btn-alert" onclick="sendAlert(${u.id}, '${u.name}')">
-                        <i class="fa fa-bell"></i> Alert
-                    </button>
-                </td>
-            </tr>
+table.innerHTML += `
+<tr>
+    <td>${u.name}</td>
+    <td>${u.lat}</td>
+    <td>${u.lon}</td>
+    <td>${temp}</td>
+    <td>${precipitation}</td>
+
+    <!-- River -->
+<td>${river.discharge.toFixed(2)}</td>
+<td>${river.level.toFixed(2)}</td>
+<td class="${
+    river.status.includes('High') ? 'text-danger fw-bold blink' :
+    river.status.includes('Moderate') ? 'text-warning fw-bold' :
+    'text-success'
+}">${river.status}</td>
+
+
+    <!-- Weather -->
+        <td class="${cycloneDetected ? 'text-primary fw-bold' : 'text-success'}">
+    ${cycloneDetected ? '🌪️ Yes' : 'No'}
+</td>
+    <td>${weather}</td>
+
+
+
+    <!-- Overall Status -->
+    <td class="${
+    status === 'High Risk' ? 'text-danger fw-bold' :
+    status === 'Moderate Risk' ? 'text-warning fw-bold' :
+    'text-success'
+}">
+${status}
+</td>
+
+
+    <td>${time}</td>
+    <td>
+        <button class="btn btn-warning btn-alert" onclick="sendAlert(${u.id}, '${u.name}')">
+            <i class="fa fa-bell"></i> Alert
+        </button>
+    </td>
+</tr>
         `;
     }
 

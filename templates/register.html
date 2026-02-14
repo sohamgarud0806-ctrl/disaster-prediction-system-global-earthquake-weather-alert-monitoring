@@ -11,6 +11,12 @@
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet" />
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/intl-tel-input/17.0.19/css/intlTelInput.min.css"/>
  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/intl-tel-input/18.2.1/css/intlTelInput.css" />
+<link
+  rel="stylesheet"
+  href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+/>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/intl-tel-input/17.0.19/js/intlTelInput.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/intl-tel-input/17.0.19/js/utils.js"></script>
 
@@ -139,6 +145,9 @@ h3 {
     color: #002244;
     box-shadow: 0 0 12px #1be4ff;
     transition: 0.25s;
+
+    /* ✅ Add this for proper spacing above the button */
+    margin-top: 20px;
 }
 
 #registerButton:hover {
@@ -150,6 +159,7 @@ h3 {
     background: gray !important;
     box-shadow: none;
 }
+
 
 .text-success { color: #4dff91 !important; }
 .text-danger { color: #ff6b6b !important; }
@@ -210,6 +220,62 @@ h3 {
 .iti input {
   background: transparent !important;
 }
+    /* Map container card */
+/* MAP CONTAINER – GLASS EFFECT */
+.map-card {
+    background: linear-gradient(145deg, rgba(255,255,255,0.12), rgba(255,255,255,0.04));
+    backdrop-filter: blur(16px);
+    border-radius: 18px;
+    padding: 18px;
+    border: 1px solid rgba(255,255,255,0.22);
+    box-shadow: 0 0 18px rgba(0,153,255,0.18);
+
+    margin-top: 24px;
+    margin-bottom: 30px;   /* ✅ ADD THIS */
+}
+
+/* Map header */
+.map-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 600;
+    font-size: 17px;                 /* slightly bigger */
+    color: #eaf6ff;
+    letter-spacing: 0.3px;
+}
+
+.map-header i {
+    color: #67e8f9;
+    font-size: 18px;
+    text-shadow: 0 0 6px rgba(103,232,249,0.6);
+}
+
+.map-header small {
+    font-weight: 400;
+    font-size: 13px;                 /* slightly bigger than before */
+    opacity: 0.7;
+}
+
+/* Map subtitle */
+.map-subtext {
+    font-size: 15px;                 /* bigger and readable */
+    color: rgba(255,255,255,0.78);
+    margin: 8px 0 12px;
+    line-height: 1.45;
+}
+
+/* Map box */
+#map {
+    height: 350px;
+    border-radius: 14px;
+    overflow: hidden;
+    border: 1px solid rgba(255,255,255,0.25);
+    box-shadow: inset 0 0 10px rgba(255,255,255,0.15);
+}
+
+
+
 </style>
 
 </head>
@@ -315,9 +381,22 @@ h3 {
 
 
             </div>
+<div class="map-card mt-4">
+    <div class="map-header">
+        <i class="fa fa-map-marker-alt"></i>
+        <span>Select Location on Map <small>(Optional)</small></span>
+    </div>
+
+    <p class="map-subtext">
+        Click anywhere on the map to automatically fill latitude & longitude
+    </p>
+
+    <div id="map"></div>
+</div>
 
             <button id="registerButton" type="submit" class="btn w-100 mt-4" disabled>Register</button>
         </form>
+<!-- OPTIONAL MAP PICKER -->
 
         <div class="login-link">
             Already have an account? <a href="/login">Login here</a>
@@ -667,20 +746,30 @@ passwordInput.addEventListener("input", () => {
     const status = document.getElementById("pass_strength");
 
     // Empty → clear
-    if (!val) {
-        status.textContent = "";
-        passwordInput.dataset.strong = "false";
-        enableRegister();
-        return;
-    }
+if (!val) {
+    status.textContent = "";
+    passwordInput.dataset.strong = "false";
+
+    // 🔥 CONFIRM PASSWORD STATUS RESET
+    const confirmStatus = document.getElementById("confirm_status");
+    confirmStatus.textContent = "";
+    confirmInput.dataset.match = "false";
+
+    enableRegister();
+    return;
+}
+
 
     // Minimum length
-    if (val.length < 6) {
-        showStatus(status, "Too short (min 6 characters)", "danger");
-        passwordInput.dataset.strong = "false";
-        enableRegister();
-        return;
-    }
+if (val.length < 6) {
+    showStatus(status, "Too short (min 6 characters)", "danger");
+    passwordInput.dataset.strong = "false";
+
+    checkPasswordMatch();   // ✅ RETURN SE PEHLE
+    enableRegister();
+    return;
+}
+
 
     // Character class checks
     const hasUpper = /[A-Z]/.test(val);
@@ -695,6 +784,7 @@ passwordInput.addEventListener("input", () => {
             "danger"
         );
         passwordInput.dataset.strong = "false";
+        checkPasswordMatch();
         enableRegister();
         return;
     }
@@ -731,21 +821,25 @@ passwordInput.addEventListener("input", () => {
             enableRegister();
         });
 
-        function checkPasswordMatch() {
-            const status = document.getElementById("confirm_status");
-            if (!confirmInput.value) {
-                status.textContent = "";
-                confirmInput.dataset.match = "false";
-                return;
-            }
-            if (passwordInput.value === confirmInput.value && confirmInput.value.length >= 6) {
-                showStatus(status, "Passwords match", "success");
-                confirmInput.dataset.match = "true";
-            } else {
-                showStatus(status, "Passwords do not match", "danger");
-                confirmInput.dataset.match = "false";
-            }
-        }
+function checkPasswordMatch() {
+    const confirmStatus = document.getElementById("confirm_status");
+
+    if (!confirmInput.value) {
+        confirmStatus.textContent = "";
+        confirmInput.dataset.match = "false";
+        return;
+    }
+
+    if (passwordInput.value === confirmInput.value) {
+        showStatus(confirmStatus, "Passwords match", "success");
+        confirmInput.dataset.match = "true";
+    } else {
+        showStatus(confirmStatus, "Passwords do not match", "danger");
+        confirmInput.dataset.match = "false";
+    }
+}
+
+
 
         // -------------------- LAT/LNG VALIDATION --------------------
  async function validateLocation() {
@@ -797,27 +891,28 @@ passwordInput.addEventListener("input", () => {
     }
 
     // ⚠ AUTO-WARNING FOR MISSING NEGATIVE SIGN (USA, Canada, South America)
-    if (lat > 0 && lon > 0) {
-        const likelyWestern = [
-            { latMin: 24, latMax: 49, lonMin: 66, lonMax: 125 },   // USA
-            { latMin: 42, latMax: 83, lonMin: 52, lonMax: 95 },    // Canada
-            { latMin: -56, latMax: 13, lonMin: 34, lonMax: 81 },   // South America
-        ];
+ // Show negative longitude warning ONLY if user is in western region
+// BUT entered positive longitude
 
-        const needsNegative = likelyWestern.some(region =>
-            lat >= region.latMin &&
-            lat <= region.latMax &&
-            lon >= region.lonMin &&
-            lon <= region.lonMax
-        );
+const westernRegions = [
+    { latMin: 24, latMax: 49, lonMin: -125, lonMax: -66 }, // USA
+    { latMin: 42, latMax: 83, lonMin: -141, lonMax: -52 }, // Canada
+    { latMin: -56, latMax: 13, lonMin: -81, lonMax: -34 }, // South America
+];
 
-        if (needsNegative) {
-            locStatus.className = "alert alert-warning";
-            locStatus.textContent =
-                "⚠ Did you forget the negative sign? These regions use negative (-) longitude.";
-            return;
-        }
-    }
+const isInWesternRegion = westernRegions.some(region =>
+    lat >= region.latMin &&
+    lat <= region.latMax &&
+    lon >= Math.abs(region.lonMin) &&  // user entered POSITIVE instead of NEGATIVE
+    lon <= Math.abs(region.lonMax)
+);
+
+if (isInWesternRegion) {
+    locStatus.className = "alert alert-warning";
+    locStatus.textContent =
+        "⚠ This region uses negative (-) longitude. Please add minus sign.";
+    return;
+}
 
     // Start fetch for reverse geocoding
     locationController = new AbortController();
@@ -900,6 +995,92 @@ document.getElementById("registerForm").addEventListener("submit", function (e) 
     }
 });
 
+
+let map = L.map("map", {
+    worldCopyJump: true,        // anti world-duplicate glitch
+    maxBoundsViscosity: 1.0
+}).setView([20.5937, 78.9629], 4);
+
+// Earth hard limits
+const MAX_BOUNDS = [
+    [-90, -180],
+    [90, 180]
+];
+
+// Prevent dragging outside Earth
+map.setMaxBounds(MAX_BOUNDS);
+
+// Tile layer
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 18,
+    noWrap: true,               // stops infinite horizontal scroll
+    attribution: "© OpenStreetMap"
+}).addTo(map);
+
+let marker = null;
+
+// Clamp helper
+function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+}
+
+/* -------------------- INPUT → MAP SYNC -------------------- */
+function syncMarkerFromInputs() {
+    const latStr = latInput.value.trim();
+    const lonStr = lonInput.value.trim();
+
+    // If either empty → remove marker
+    if (!latStr || !lonStr) {
+        if (marker) {
+            map.removeLayer(marker);
+            marker = null;
+        }
+        return;
+    }
+
+    const lat = parseFloat(latStr);
+    const lon = parseFloat(lonStr);
+
+    // Invalid numbers → ignore
+    if (isNaN(lat) || isNaN(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) return;
+
+    // Place / update marker
+    if (marker) {
+        marker.setLatLng([lat, lon]);
+    } else {
+        marker = L.marker([lat, lon], { draggable: false }).addTo(map);
+    }
+
+    // Move map smoothly to marker
+    map.setView([lat, lon], Math.max(map.getZoom(), 6), { animate: true });
+}
+
+// Listen to manual input changes
+latInput.addEventListener("input", syncMarkerFromInputs);
+lonInput.addEventListener("input", syncMarkerFromInputs);
+
+/* -------------------- MAP → INPUT SYNC -------------------- */
+map.on("click", function (e) {
+    if (!e || !e.latlng) return;
+
+    let latNum = clamp(e.latlng.lat, -90, 90);
+    let lonNum = clamp(e.latlng.lng, -180, 180);
+
+    if (isNaN(latNum) || isNaN(lonNum)) return;
+
+    const latStr = latNum.toFixed(6);
+    const lonStr = lonNum.toFixed(6);
+
+    // Fill inputs → triggers syncMarkerFromInputs automatically
+    latInput.value = latStr;
+    lonInput.value = lonStr;
+
+    latInput.dispatchEvent(new Event("input", { bubbles: true }));
+    lonInput.dispatchEvent(new Event("input", { bubbles: true }));
+});
+
+/* -------------------- MAP FIX FOR HIDDEN/RESIZED CONTAINER -------------------- */
+setTimeout(() => map.invalidateSize(), 300);
 
     </script>
 

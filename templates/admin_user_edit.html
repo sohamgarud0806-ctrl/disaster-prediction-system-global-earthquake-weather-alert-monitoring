@@ -14,13 +14,16 @@
 <!-- Google Fonts -->
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 
-<!-- Leaflet CSS -->
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.5/dist/leaflet.css"/>
+<link
+  rel="stylesheet"
+  href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+/>
+<!-- Leaflet JS (PEHLE) -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
-<!-- Leaflet Geosearch -->
-<link rel="stylesheet" href="https://unpkg.com/leaflet-geosearch@3.1.0/dist/geosearch.css"/>
-<script src="https://unpkg.com/leaflet@1.9.5/dist/leaflet.js"></script>
-<script src="https://unpkg.com/leaflet-geosearch@3.1.0/dist/bundle.min.js"></script>
+<!-- Bootstrap JS -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+
 
 <style>
 body {
@@ -81,14 +84,7 @@ input:focus {
   background: rgba(255,255,255,0.25);
 }
 
-#map {
-  height: 350px;
-  border-radius: 15px;
-  margin-bottom: 18px;
-  border: 1px solid rgba(255,255,255,0.3);
-  box-shadow: 0 4px 15px rgba(0,0,0,0.2);
-  background: #e5e5e5;
-}
+
 
 .btn-group {
   display: flex;
@@ -137,6 +133,15 @@ input:focus {
   backdrop-filter: blur(8px);
   margin-bottom: 20px;
 }
+  #map {
+  height: 300px;
+  width: 100%;
+  margin-top: 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,0.3);
+  box-shadow: 0 10px 25px rgba(0,0,0,0.35);
+}
+
 </style>
 </head>
 <body>
@@ -197,71 +202,124 @@ input:focus {
   </form>
 </div>
 
+
+
+<!-- Tumhara Custom Script (LAST) -->
 <script>
-// Initialize map
-document.addEventListener("DOMContentLoaded", function() {
-  let lat = parseFloat("{{ user[5] or 0 }}");
-  let lon = parseFloat("{{ user[6] or 0 }}");
+  // Form validation
+  function validateForm() {
+    const lat = parseFloat(document.getElementById('latitude').value);
+    const lon = parseFloat(document.getElementById('longitude').value);
 
-  const map = L.map('map', { zoomControl: true }).setView([lat, lon], 5);
-
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '© OpenStreetMap contributors'
-  }).addTo(map);
-
-  const marker = L.marker([lat, lon], {draggable:true}).addTo(map);
-
-  marker.on('dragend', function() {
-    const pos = marker.getLatLng();
-    document.getElementById('latitude').value = pos.lat.toFixed(6);
-    document.getElementById('longitude').value = pos.lng.toFixed(6);
-  });
-
-  map.on('click', function(e) {
-    marker.setLatLng(e.latlng);
-    document.getElementById('latitude').value = e.latlng.lat.toFixed(6);
-    document.getElementById('longitude').value = e.latlng.lng.toFixed(6);
-  });
-
-  // GeoSearch
-  const provider = new GeoSearch.OpenStreetMapProvider();
-  const searchControl = new GeoSearch.GeoSearchControl({ provider, style:'bar', showMarker:false });
-  map.addControl(searchControl);
-
-  map.on('geosearch/showlocation', function(result) {
-    const latlng = result.location;
-    marker.setLatLng([latlng.y, latlng.x]);
-    map.setView([latlng.y, latlng.x], 12);
-    document.getElementById('latitude').value = latlng.y.toFixed(6);
-    document.getElementById('longitude').value = latlng.x.toFixed(6);
-  });
-
-  setTimeout(() => map.invalidateSize(), 300);
-});
-
-// Form validation
-function validateForm() {
-  const lat = parseFloat(document.getElementById('latitude').value);
-  const lon = parseFloat(document.getElementById('longitude').value);
-
-  if (isNaN(lat) || lat < -90 || lat > 90) {
-    alert("Please enter a valid latitude (-90 to 90).");
-    return false;
+    if (isNaN(lat) || lat < -90 || lat > 90) {
+      alert("Please enter a valid latitude (-90 to 90).");
+      return false;
+    }
+    if (isNaN(lon) || lon < -180 || lon > 180) {
+      alert("Please enter a valid longitude (-180 to 180).");
+      return false;
+    }
+    return true;
   }
-  if (isNaN(lon) || lon < -180 || lon > 180) {
-    alert("Please enter a valid longitude (-180 to 180).");
-    return false;
-  }
-  return true;
+
+  // Auto-close flash messages
+  setTimeout(() => {
+    document.querySelectorAll('.alert')
+      .forEach(a => new bootstrap.Alert(a).close());
+  }, 4500);
+
+  /* ============================
+     LEAFLET MAP
+  ============================ */
+  let latInput = document.getElementById('latitude');
+let lonInput = document.getElementById('longitude');
+
+/* ============================
+   HELPERS
+============================ */
+function clampLatLon(lat, lon) {
+  // Clamp latitude
+  lat = Math.max(-90, Math.min(90, lat));
+
+  // Normalize longitude to -180 .. 180
+  lon = ((lon + 180) % 360 + 360) % 360 - 180;
+
+  return { lat, lon };
 }
 
-// Auto-close flash messages after 4.5 seconds
-setTimeout(() => {
-  document.querySelectorAll('.alert').forEach(a => new bootstrap.Alert(a).close());
-}, 4500);
+/* ============================
+   INITIAL VALUES
+============================ */
+let startLat = latInput.value ? parseFloat(latInput.value) : 20.5937;
+let startLon = lonInput.value ? parseFloat(lonInput.value) : 78.9629;
+
+let fixedStart = clampLatLon(startLat, startLon);
+
+/* ============================
+   MAP INIT
+============================ */
+let map = L.map('map', {
+  worldCopyJump: true
+}).setView([fixedStart.lat, fixedStart.lon], 5);
+
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+/* ============================
+   MARKER
+============================ */
+let marker = L.marker(
+  [fixedStart.lat, fixedStart.lon],
+  { draggable: true }
+).addTo(map);
+
+/* ============================
+   EVENTS
+============================ */
+
+// Marker drag
+marker.on('dragend', () => {
+  let pos = marker.getLatLng();
+  let fixed = clampLatLon(pos.lat, pos.lng);
+
+  latInput.value = fixed.lat.toFixed(6);
+  lonInput.value = fixed.lon.toFixed(6);
+
+  marker.setLatLng([fixed.lat, fixed.lon]);
+});
+
+// Map click
+map.on('click', (e) => {
+  let fixed = clampLatLon(e.latlng.lat, e.latlng.lng);
+
+  latInput.value = fixed.lat.toFixed(6);
+  lonInput.value = fixed.lon.toFixed(6);
+
+  marker.setLatLng([fixed.lat, fixed.lon]);
+});
+
+// Manual input change
+function updateMapFromInputs() {
+  let latVal = parseFloat(latInput.value);
+  let lonVal = parseFloat(lonInput.value);
+
+  if (!isNaN(latVal) && !isNaN(lonVal)) {
+    let fixed = clampLatLon(latVal, lonVal);
+
+    latInput.value = fixed.lat.toFixed(6);
+    lonInput.value = fixed.lon.toFixed(6);
+
+    marker.setLatLng([fixed.lat, fixed.lon]);
+    map.setView([fixed.lat, fixed.lon], 10);
+  }
+}
+
+latInput.addEventListener('change', updateMapFromInputs);
+lonInput.addEventListener('change', updateMapFromInputs);
+
 </script>
 
-<!-- Bootstrap JS -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>

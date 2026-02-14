@@ -11,9 +11,12 @@ from werkzeug.utils import secure_filename
 import textwrap
 from reportlab.pdfgen import canvas
 # Standard Libraries
+import threading
+
 import os
 import random
 import json
+import socket
 import yaml
 import urllib.request
 import time
@@ -34,7 +37,8 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.tree import DecisionTreeClassifier, export_graphviz
 import joblib
 import tensorflow.compat.v1 as tf
-
+from pymysql.err import OperationalError, InterfaceError, InternalError
+from sqlalchemy.exc import OperationalError as SAOperationalError
 tf.disable_v2_behavior()
 # tf.compat.v1.enable_eager_execution()
 from bs4 import BeautifulSoup
@@ -56,22 +60,30 @@ if ENV == "local":
 
     load_dotenv()
 
-db = pymysql.connect(
+
+class SafeMySQL(pymysql.connections.Connection):
+    def cursor(self, *args, **kwargs):
+        try:
+            # Try ping first to keep connection alive
+            self.ping(reconnect=True)
+        except pymysql.MySQLError:
+            # Agar ping fail ho gaya → ignore, next cursor call automatically reconnect
+            pass
+        return super().cursor(*args, **kwargs)
+
+# Initialize DB connection
+db = SafeMySQL(
     host=os.environ["MYSQL_HOST"],
     user=os.environ["MYSQL_USER"],
     password=os.environ["MYSQL_PASSWORD"],
     database=os.environ["MYSQL_DATABASE"],
     port=int(os.environ.get("MYSQL_PORT", "3306")),
-    connect_timeout=10,
+    connect_timeout=30,
+    read_timeout=30,
+    write_timeout=30,
     autocommit=True,
     charset="utf8mb4"
 )
-
-# Auto-reconnect if connection drops (Render / Railway safe)
-try:
-    db.ping(reconnect=True)
-except Exception as e:
-    print("DB reconnect failed:", e)
 
 print("RENDER =", os.getenv("RENDER"))
 print("MYSQL_HOST =", os.getenv("MYSQL_HOST"))
@@ -90,6 +102,7 @@ app.config['MAIL_PORT'] = int(os.environ.get("MAIL_PORT", 587))
 app.config['MAIL_USE_TLS'] = os.environ.get("MAIL_USE_TLS") == "True"
 app.config['MAIL_USERNAME'] = os.environ.get("MAIL_USERNAME")
 app.config['MAIL_PASSWORD'] = os.environ.get("MAIL_PASSWORD")
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL")
  # CHANGE
 print("APP_ENV:", os.getenv("APP_ENV"))
 print("MAIL_SERVER:", os.getenv("MAIL_SERVER"))
@@ -110,6 +123,7 @@ db_port = os.environ.get("MYSQL_PORT", "3306")
 
 app.config["SQLALCHEMY_DATABASE_URI"] = f"mysql+pymysql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
 
 # initialize SQLAlchemy
 sqldb.init_app(app)
@@ -142,10 +156,98 @@ def get_db_connection():
         autocommit=True
     )
 
+last_db_alert_time = None
+
+def send_db_alert_once(error_msg):
+    global last_db_alert_time
+
+    if not ADMIN_EMAIL:
+        return
+
+    # 15 min me ek hi alert
+    if last_db_alert_time and datetime.utcnow() - last_db_alert_time < timedelta(minutes=15):
+        return  # spam block
+
+    try:
+        msg = Message(
+            subject="🚨 DATABASE DOWN ALERT",
+            recipients=[ADMIN_EMAIL],
+            body=f"MySQL Error Detected:\n\n{error_msg}\n\nTime (UTC): {datetime.utcnow()}"
+        )
+        mail.send(msg)
+        last_db_alert_time = datetime.utcnow()
+    except Exception as e:
+        print("Mail alert failed:", e)
 
 
+# =========================
+# Network check helper
+# =========================
+def is_network_alive(host="8.8.8.8", port=53, timeout=2):
+    """Check if internet/network is available"""
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
+        return True
+    except Exception:
+        return False
 
 
+# =========================
+# Before request: network + DB check
+# =========================
+@app.before_request
+def check_network_or_db():
+    # 1. Network check
+    if not is_network_alive():
+        return render_template(
+            "error.html",
+            code=503,
+            title="Network Unavailable",
+            message="Internet/Wi-Fi is down.<br>Please try again after some time."
+        ), 503
+
+    # 2. DB check
+    try:
+        db.ping(reconnect=True)
+    except Exception as e:
+        send_db_alert_once(str(e))
+        return render_template(
+            "error.html",
+            code=503,
+            title="Database Down",
+            message="Database is temporarily unavailable.<br>Please try again after some time."
+        ), 503
+
+
+# =========================
+# MySQL / SQLAlchemy errors
+# =========================
+@app.errorhandler(OperationalError)
+@app.errorhandler(InterfaceError)
+@app.errorhandler(InternalError)
+@app.errorhandler(SAOperationalError)
+def handle_mysql_error(e):
+    send_db_alert_once(str(e))
+    return render_template(
+        "error.html",
+        code=503,
+        title="Service Temporarily Unavailable",
+        message="Database service is temporarily unavailable.<br>Please try again shortly."
+    ), 503
+
+
+# =========================
+# Generic 500 error (NO blanket Exception)
+# =========================
+@app.errorhandler(500)
+def internal_error(e):
+    return render_template(
+        "error.html",
+        code=500,
+        title="Unexpected Error",
+        message="Something went wrong.<br>Please try again later."
+    ), 500
 
 from flask import jsonify
 import csv
@@ -848,16 +950,30 @@ def resend_otp():
     msg.body = f"""
 Hello,
 
-A new verification code has been generated at your request.
+We received a request to verify your account using a One-Time Password (OTP). Please find your verification code below:
 
+━━━━━━━━━━━━━━━━━━━━━━
 🔐 Your One-Time Password (OTP): {otp_code}
+━━━━━━━━━━━━━━━━━━━━━━
 
-This code is valid for the next 5 minutes.
-Do NOT share this code with anyone.
+This OTP is valid for the next 5 minutes only.
+Please enter this code on the verification screen to complete your request.
 
-Resend attempt: {session['resend_count']} of 3
+⚠️ Important Security Information:
 
-If this was not you, please secure your account immediately.
+Do NOT share this OTP with anyone, including our staff.
+
+Our team will never ask for your OTP via phone, email, or message.
+
+If the OTP expires, you will need to request a new one.
+
+🔁 Resend Attempts: {session['resend_count']} out of 3
+(For your security, the number of OTP resend attempts is limited.)
+
+❗ Didn’t request this code?
+If you did not initiate this request, please ignore this email and take immediate steps to secure your account by changing your password or contacting support.
+
+Thank you for helping us keep your account safe.
 
 Regards,
 Disaster Alert Security Team
@@ -1115,28 +1231,28 @@ def admin_resend_otp():
         sender_pass = "pqpbruceisevbjpd"
 
         msg_body = textwrap.dedent(f"""
-                        Hello {admin_name},
+            Hello {admin_name},
 
-        We received a request to generate a new One-Time Password (OTP) for
-        your administrator account on the Disaster Alert System.
+We received a request to generate a new One-Time Password (OTP) for
+your administrator account on the Disaster Alert System.
 
-        🔐 Your NEW OTP is: {new_otp}
+🔐 Your NEW OTP is: {new_otp}
 
 
-        ⏳ This OTP is valid for 5 minutes only and can be used once.
-        For your security, please do not share this OTP with anyone.
-        Our team will never ask for your OTP.
+⏳ This OTP is valid for 5 minutes only and can be used once.
+For your security, please do not share this OTP with anyone.
+Our team will never ask for your OTP.
 
-        ⚠️ Security Notice:
-        If you did NOT request this OTP, your account may be at risk.
-        Please change your password immediately and contact the system
-        administrator or support team.
+⚠️ Security Notice:
+If you did NOT request this OTP, your account may be at risk.
+Please change your password immediately and contact the system
+administrator or support team.
 
-        Thank you for keeping your account secure.
+Thank you for keeping your account secure.
 
-        Regards,
-        Disaster Alert System
-        (Security Team – Automated Message)
+Regards,
+Disaster Alert System
+(Security Team – Automated Message)
         """).strip()
         msg = MIMEText(msg_body)
         msg["Subject"] = "Your New Admin Login OTP"
@@ -1802,6 +1918,42 @@ def download_feedback_pdf(disaster_type):
         as_attachment=True
     )
 
+def send_user_notification(user_email, feedback_id):
+    subject = "Reply to your feedback"
+    body = f"""
+ Hello,
+
+We hope you are doing well.
+
+This is to inform you that our admin team has reviewed your feedback and posted a response.
+
+Feedback Reference ID: {feedback_id}
+
+To view the full reply and continue the conversation, please log in to your account on our website.
+
+If you have any additional questions or need further assistance, feel free to submit another feedback or reply through the portal.
+
+ Thank you for taking the time to help us improve our services.
+
+ Best regards,
+ Support Team
+"""
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = "disasterpredictionsystem@gmail.com"
+    msg["To"] = user_email
+
+    try:
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login("disasterpredictionsystem@gmail.com", "pqpbruceisevbjpd")
+        server.send_message(msg)
+        server.quit()
+    except Exception as e:
+        print("Email error:", e)
+
+
 
 @app.route("/api/feedback/reply/<int:feedback_id>", methods=["POST"])
 def reply_feedback(feedback_id):
@@ -1811,7 +1963,6 @@ def reply_feedback(feedback_id):
     if not reply_msg:
         return jsonify({"error": "Reply message required"}), 400
 
-    # ✅ STRICT ADMIN CHECK
     if "admin_id" not in session:
         return jsonify({"error": "Admin not logged in"}), 401
 
@@ -1819,21 +1970,39 @@ def reply_feedback(feedback_id):
     admin_username = session.get("admin_username", "Admin")
 
     conn = get_db_connection()
-    cursor = conn.cursor()
+    cursor = conn.cursor(pymysql.cursors.DictCursor)
 
     try:
-        # feedback exists?
-        cursor.execute("SELECT id FROM feedback WHERE id=%s", (feedback_id,))
-        if not cursor.fetchone():
+        # 🔹 Get user email
+        cursor.execute("""
+            SELECT u.email
+            FROM feedback f
+            JOIN users u ON f.user_id = u.id
+            WHERE f.id = %s
+        """, (feedback_id,))
+        row = cursor.fetchone()
+
+        if not row:
             return jsonify({"error": "Feedback not found"}), 404
 
-        # ✅ INSERT WITH VALID admin_id
+        user_email = row["email"]
+
+        # 🔹 Insert reply
         cursor.execute("""
-                       INSERT INTO replies (feedback_id, admin_id, admin_username, message, date)
-                       VALUES (%s, %s, %s, %s, NOW())
-                       """, (feedback_id, admin_id, admin_username, reply_msg))
+            INSERT INTO replies (feedback_id, admin_id, admin_username, message, date)
+            VALUES (%s, %s, %s, %s, NOW())
+        """, (feedback_id, admin_id, admin_username, reply_msg))
 
         conn.commit()
+
+        # 🔹 SEND EMAIL IN BACKGROUND (NON-BLOCKING) ✅
+        if user_email:
+            threading.Thread(
+                target=send_user_notification,
+                args=(user_email, feedback_id),
+                daemon=True
+            ).start()
+
         return jsonify({"success": True})
 
     finally:
@@ -1942,40 +2111,104 @@ def delete_feedback(fid):
 WEATHER_KEY = "fb116bebc392ccc8ab251927edcb55d6"  # set this
 
 
+# 🔹 ALTERNATE river level calculation function
+def calculate_river_level(discharge, river_type="medium"):
+    """
+    Unified & realistic river level calculation
+    Matches frontend + backend + alerts
+    """
+
+    if discharge is None or discharge <= 0:
+        base = {"small": 0.35, "medium": 0.70, "large": 1.50}
+        return round(base.get(river_type, 0.70), 2)
+
+    coeffs = {
+        "small":  {"a": 0.18, "b": 0.48, "bed": 0.35},
+        "medium": {"a": 0.22, "b": 0.44, "bed": 0.70},
+        "large":  {"a": 0.14, "b": 0.40, "bed": 1.50},
+    }
+
+    c = coeffs.get(river_type, coeffs["medium"])
+    level = c["bed"] + c["a"] * (discharge ** c["b"])
+
+    level = max(c["bed"], min(level, 30))  # safety clamp
+    return round(level, 2)
+
+
+# ==============================
+# 🔹 Modified /admin/flood_real_time route
+# ==============================
 @app.route("/admin/flood_real_time")
 def flood_real_time():
-    # Only admin can access
     if "admin_id" not in session:
         return redirect("/admin_login")
 
+    db = get_db_connection()
     cursor = db.cursor()
+
     cursor.execute("SELECT id, name, email, latitude, longitude FROM users")
     users = cursor.fetchall()
 
     user_flood_data = []
 
     for u in users:
-        uid, name, email, lat, lon = u
+        uid = u["id"]
+        name = u["name"]
+        email = u["email"]
+        lat = u["latitude"]
+        lon = u["longitude"]
 
         if lat is None or lon is None:
             continue
 
-        # Fetch real-time weather
-        url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&units=metric&appid={WEATHER_KEY}"
-        data = requests.get(url).json()
+        # 🌦 WEATHER
+        try:
+            w = requests.get(
+                f"https://api.openweathermap.org/data/2.5/weather"
+                f"?lat={lat}&lon={lon}&units=metric&appid={WEATHER_KEY}",
+                timeout=10
+            ).json()
 
-        rainfall = data.get("rain", {}).get("1h", 0)
-        temperature = data["main"]["temp"]
-        humidity = data["main"]["humidity"]
-        weather = data["weather"][0]["description"]
+            rainfall = w.get("rain", {}).get("1h", 0)
+            temperature = w["main"]["temp"]
+            humidity = w["main"]["humidity"]
+            wind_speed = w.get("wind", {}).get("speed", 0) * 3.6  # km/h
+            pressure = w["main"].get("pressure", 1013)
 
-        # Flood risk based on rainfall + humidity
-        if rainfall >= 30:
-            risk = "High"
-        elif rainfall >= 10:
-            risk = "Medium"
-        else:
-            risk = "Low"
+            cyclone_detected = (
+                    wind_speed >= 62 or pressure <= 990
+            )
+
+            weather_status = w["weather"][0]["description"]
+
+            risk = "High" if rainfall >= 30 else "Medium" if rainfall >= 10 else "Low"
+
+        except Exception:
+            rainfall = temperature = humidity = 0
+            weather_status = "Unavailable"
+            risk = "Unknown"
+
+        # 🌊 RIVER
+        try:
+            r = requests.get(
+                f"https://flood-api.open-meteo.com/v1/flood"
+                f"?latitude={lat}&longitude={lon}&daily=river_discharge&timezone=auto",
+                timeout=10
+            ).json()
+
+            discharge = r.get("daily", {}).get("river_discharge", [0])[0]
+            level = calculate_river_level(discharge, "medium")
+
+            if level >= 7 or discharge >= 7000:
+                river_status = "High Flood Risk"
+            elif level >= 6 or discharge >= 5000:
+                river_status = "Moderate Risk"
+            else:
+                river_status = "Safe"
+
+        except Exception:
+            discharge = level = 0
+            river_status = "Unavailable"
 
         user_flood_data.append({
             "id": uid,
@@ -1986,71 +2219,163 @@ def flood_real_time():
             "rainfall": rainfall,
             "humidity": humidity,
             "temperature": temperature,
-            "weather": weather,
-            "risk": risk
+            "weather": weather_status,
+            "risk": risk,
+            "user_wind": round(wind_speed, 1),
+            "user_pressure": pressure,
+            "cyclone": cyclone_detected,
+            "river_discharge": discharge,
+            "river_level": level,
+            "river_status": river_status
         })
+
+    cursor.close()
+    db.close()
 
     return render_template("admin_flood_real_time.html", data=user_flood_data)
 
-
 @app.route("/api/get_users_locations")
 def get_users_locations():
+    db = get_db_connection()
     cursor = db.cursor()
+
     cursor.execute("SELECT id, name, latitude, longitude FROM users")
     rows = cursor.fetchall()
 
-    user_list = []
-    for r in rows:
-        user_list.append({
-            "id": r[0],  # include the user ID
-            "name": r[1],
-            "lat": r[2],
-            "lon": r[3]
-        })
+    cursor.close()
+    db.close()
 
-    return jsonify(user_list)
-
+    return jsonify([
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "lat": r["latitude"],
+            "lon": r["longitude"]
+        } for r in rows
+    ])
 
 @app.route("/admin/flood_alert/<int:user_id>", methods=["POST"])
 def admin_flood_alert(user_id):
     if "admin" not in session:
         return redirect("/admin_login")
 
-    message = request.form.get("alert_message", "Flood risk detected in your area. Stay safe!")
+    message = request.form.get(
+        "alert_message",
+        "Flood risk detected in your area. Stay safe!"
+    )
 
-    # Fetch user location + weather
+    db = get_db_connection()
     cursor = db.cursor()
-    cursor.execute("SELECT id, name, email, latitude, longitude FROM users WHERE id=%s", (user_id,))
+
+    cursor.execute(
+        "SELECT id, name, email, latitude, longitude FROM users WHERE id=%s",
+        (user_id,)
+    )
     u = cursor.fetchone()
 
     if not u:
+        cursor.close()
+        db.close()
         flash("User not found!", "danger")
         return redirect("/admin/flood_real_time")
 
-    uid, name, email, lat, lon = u
+    uid, name, email, lat, lon = u.values()
 
-    # Get weather again
-    url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&units=metric&appid={WEATHER_KEY}"
-    data = requests.get(url).json()
+    # WEATHER
+    try:
+        w = requests.get(
+            f"https://api.openweathermap.org/data/2.5/weather"
+            f"?lat={lat}&lon={lon}&units=metric&appid={WEATHER_KEY}",
+            timeout=10
+        ).json()
 
-    rainfall = data.get("rain", {}).get("1h", 0)
-    humidity = data["main"]["humidity"]
-    temperature = data["main"]["temp"]
-    weather_status = data["weather"][0]["description"]
+        rainfall = w.get("rain", {}).get("1h", 0)
+        humidity = w["main"]["humidity"]
+        temperature = w["main"]["temp"]
+        weather_status = w["weather"][0]["description"]
 
-    # Save to DB
+    except Exception:
+        rainfall = humidity = temperature = 0
+        weather_status = "Unavailable"
+
+    # RIVER
+    try:
+        r = requests.get(
+            f"https://flood-api.open-meteo.com/v1/flood"
+            f"?latitude={lat}&longitude={lon}&daily=river_discharge&timezone=auto",
+            timeout=10
+        ).json()
+
+        discharge = r.get("daily", {}).get("river_discharge", [0])[0]
+        level = calculate_river_level(discharge)
+
+        if level >= 7 or discharge >= 7000:
+            river_status = "High Flood Risk"
+        elif level >= 6 or discharge >= 5000:
+            river_status = "Moderate Risk"
+        else:
+            river_status = "Safe"
+
+    except Exception:
+        discharge = level = 0
+        river_status = "Unavailable"
+
     cursor.execute("""
-                   INSERT INTO flood_alerts (user_id, rainfall, humidity, temperature, status, alert_message)
-                   VALUES (%s, %s, %s, %s, %s, %s)
-                   """, (uid, rainfall, humidity, temperature, weather_status, message))
+        INSERT INTO flood_alerts
+        (user_id, rainfall, humidity, temperature, weather_status,
+         river_discharge, river_level, river_status, alert_message)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        uid, rainfall, humidity, temperature, weather_status,
+        discharge, level, river_status, message
+    ))
 
     db.commit()
+    cursor.close()
+    db.close()
 
-    # Send Email Alert
-    send_flood_alert_email(email, name, message, rainfall, humidity, temperature)
+    send_flood_alert_email(
+        email, name, message,
+        rainfall, humidity, temperature,
+        river_discharge=discharge,
+        river_level=level,
+        river_status=river_status
+    )
 
     flash("Flood alert sent successfully!", "success")
     return redirect("/admin/flood_real_time")
+
+
+@app.route("/update_user_location", methods=["POST"])
+def update_user_location():
+    if "user_id" not in session:
+        return jsonify({"status": "unauthorized"}), 401
+
+    data = request.json
+    lat = data.get("latitude")
+    lon = data.get("longitude")
+    depth = data.get("depth", 0)
+
+    cursor = db.cursor()
+    cursor.execute("""
+        UPDATE users
+        SET latitude=%s, longitude=%s, depth=%s
+        WHERE id=%s
+    """, (lat, lon, depth, session["user_id"]))
+    db.commit()
+
+    return jsonify({
+        "status": "ok",
+        "row": {
+            "id": session["user_id"],
+            "lat": lat,
+            "lon": lon,
+            "depth": depth,
+            "magnitude": 0,
+            "alert": "No",
+            "date": datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
+        }
+    })
 
 
 def is_valid_email(email):
@@ -2058,49 +2383,60 @@ def is_valid_email(email):
     return re.match(pattern, email)
 
 
-def send_flood_alert_email(email, name, message, rainfall, humidity, temperature):
-    sender = "disasterpredictionsystem@gmail.com"
-    password = "pqpbruceisevbjpd"
+# -------------------------
+# Helper functions
+# -------------------------
+def calculateRiverLevel(discharge, riverType="medium"):
+    if discharge is None:
+        return None
 
-    if not is_valid_email(email):
-        print(f"❌ Invalid email: {email}")
-        return False
+    if riverType == "small":
+        a = 0.20
+        b = 0.50
+        bedLevel = 0.30
+    elif riverType == "large":
+        a = 0.15
+        b = 0.42
+        bedLevel = 1.20
+    else:  # medium
+        a = 0.25
+        b = 0.45
+        bedLevel = 0.60
 
-    body = f"""
-Dear {name},
+    if discharge <= 0:
+        return round(bedLevel, 2)
 
-FLOOD RISK ALERT ⚠️
+    level = bedLevel + a * (discharge ** b)
 
-Location Weather Summary:
-🌧 Rainfall (1h): {rainfall} mm
-💧 Humidity: {humidity}%
-🌡 Temperature: {temperature}°C
+    # realistic clamp
+    level = max(bedLevel, min(level, 25))
 
-Admin Message:
-{message}
+    return round(level, 2)
 
-Stay safe!
-"""
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = "⚠️ Flood Risk Alert - Disaster Alert System"
-    msg["From"] = sender
-    msg["To"] = email
-
+def fetchRiverDischarge(lat, lon):
     try:
-        server = smtplib.SMTP("smtp.gmail.com", 587)
-        server.starttls()
-        server.login(sender, password)
-        server.send_message(msg)
-        server.quit()
-        print(f"✅ Alert sent to {email}")
-        return True
+        url = f"https://flood-api.open-meteo.com/v1/flood?latitude={lat}&longitude={lon}&daily=river_discharge&timezone=auto"
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        discharge = data.get("daily", {}).get("river_discharge", [0])[0] or 0
+        level = calculateRiverLevel(discharge)
+        status = "Safe"
+        if level >= 7 or discharge >= 7000:
+            status = "High Flood Risk"
+        elif level >= 6 or discharge >= 5000:
+            status = "Moderate Risk"
+        return {
+            "discharge": round(discharge, 2),
+            "level": round(level, 2),
+            "status": status
+        }
     except Exception as e:
-        print(f"❌ Failed to send alert: {e}")
-        return False
+        print(f"❌ Failed to fetch river data: {e}")
+        return {"discharge": 0, "level": 0, "status": "Unavailable"}
 
 
 # -------------------------
-# Route to send alert
+# Combined send_alert with river + weather
 # -------------------------
 @app.route("/send_alert/<int:user_id>", methods=["POST"])
 def send_alert(user_id):
@@ -2147,18 +2483,92 @@ def send_alert(user_id):
         rainfall = weather.get("rain", {}).get("1h", 0)
         humidity = weather["main"]["humidity"]
         temperature = weather["main"]["temp"]
+        weather_status = weather["weather"][0]["description"]
+        wind_speed = weather.get("wind", {}).get("speed", 0) * 3.6  # km/h
+        pressure = weather.get("main", {}).get("pressure", 1013)
+
+        cyclone_detected = (
+                wind_speed >= 62 or pressure <= 990
+        )
+
         print(f"🌡 Weather: Temp={temperature}°C, Rainfall={rainfall}mm, Humidity={humidity}%")
+
+        # Fetch river data once
+        river = fetchRiverDischarge(lat, lon)
+        print(f"🌊 River: Discharge={river['discharge']}, Level={river['level']}, Status={river['status']}")
 
         # Send alert to all users at the same location
         failed = []
         for u in users_at_location:
             print(f"✉ Sending alert to {u['name']} ({u['email']})...")
-            success = send_flood_alert_email(u["email"], u["name"], message, rainfall, humidity, temperature)
-            if success:
+
+            # Email body with river info
+            body = f"""
+Dear {u['name']},
+
+FLOOD RISK ALERT ⚠️
+
+Location Weather Summary:
+🌧 Rainfall (1h): {rainfall} mm
+💧 Humidity: {humidity}%
+🌡 Temperature: {temperature}°C
+🌦 Weather: {weather_status}
+🌪 Cyclone Information:
+Cyclone Detected: {"YES" if cyclone_detected else "NO"}
+💨 Wind Speed: {wind_speed:.1f} km/h
+⬇️ Pressure: {pressure} hPa
+
+River Info:
+💦 Discharge: {river['discharge']} m³/s
+📏 Level: {river['level']} m
+⚠ Status: {river['status']}
+
+Admin Message:
+{message}
+
+Stay safe!
+"""
+            msg = MIMEText(body, "plain", "utf-8")
+            msg["Subject"] = "⚠️ Flood Risk Alert - Disaster Alert System"
+            msg["From"] = "disasterpredictionsystem@gmail.com"
+            msg["To"] = u["email"]
+
+            try:
+                server = smtplib.SMTP("smtp.gmail.com", 587)
+                server.starttls()
+                server.login("disasterpredictionsystem@gmail.com", "pqpbruceisevbjpd")
+                server.send_message(msg)
+                server.quit()
                 print(f"✅ Alert sent to {u['name']}")
-            else:
-                print(f"❌ Failed to send alert to {u['name']}")
+            except Exception as e:
+                print(f"❌ Failed to send alert to {u['name']}: {e}")
                 failed.append(u["name"])
+
+            # Save alert to DB with river info
+            with db.cursor() as cursor:
+                cursor.execute("""
+                               INSERT INTO flood_alerts
+                               (user_id, rainfall, humidity, temperature, status, alert_message,
+                                river_discharge, river_level, river_status,
+                                cyclone_detected, wind_speed, pressure)
+                               VALUES (%s, %s, %s, %s, %s, %s,
+                                       %s, %s, %s,
+                                       %s, %s, %s)
+                               """, (
+                                   u["id"],
+                                   rainfall,
+                                   humidity,
+                                   temperature,
+                                   weather_status,
+                                   message,
+                                   river["discharge"],
+                                   river["level"],
+                                   river["status"],
+                                   1 if cyclone_detected else 0,
+                                   wind_speed,
+                                   pressure
+                               ))
+            db.commit()
 
         if failed:
             print(f"⚠ Partial failures: {failed}")
@@ -2172,62 +2582,62 @@ def send_alert(user_id):
         print(f"❌ Exception occurred: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-
 # USGS_FEED_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson"
 
 @app.route("/admin/earthquake_dashboard")
 def earthquake_dashboard():
+    if "admin_id" not in session:
+        flash("Please login first.", "warning")
+        return redirect(url_for("admin_login"))
     return render_template("earthquake_dashboard.html")
-
-
 @app.route("/api/get_users_earthquakes")
 def get_users_earthquakes():
     import requests
     from flask import jsonify
-    import pymysql
-    from datetime import datetime, timedelta
+    from datetime import datetime
 
-    db = pymysql.connect(host="localhost", user="root", passwd="", db="dmnat")
-    cursor = db.cursor(pymysql.cursors.DictCursor)
+    db = get_db_connection()
+    cursor = db.cursor()
 
-    # Fetch users (optional, for showing markers)
     cursor.execute("SELECT name, latitude, longitude FROM users")
     users = cursor.fetchall()
 
-    # Historical earthquakes (past 30 days)
-    end_date = datetime.utcnow().date()
-    start_date = end_date - timedelta(days=30)
-
+    # 🔴 USGS LIVE ALL-HOUR FEED
     feed = requests.get(
-        "https://earthquake.usgs.gov/fdsnws/event/1/query",
-        params={
-            "format": "geojson",
-            "starttime": start_date.strftime("%Y-%m-%d"),
-            "endtime": end_date.strftime("%Y-%m-%d"),
-            "minmagnitude": 4.0
-        },
-        timeout=15
+        "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson",
+        timeout=10
     ).json()
 
     earthquakes = []
 
     for eq in feed.get("features", []):
-        coords = eq.get("geometry", {}).get("coordinates", [0, 0, 0])
-        props = eq.get("properties", {})
+        coords = eq["geometry"]["coordinates"]
+        props = eq["properties"]
+
         earthquakes.append({
+            "event_id": eq["id"],                 # 🔑 unique (important)
             "eq_lat": coords[1],
             "eq_lon": coords[0],
             "depth": coords[2],
             "magnitude": props.get("mag", 0),
-            "time": props.get("time", 0)
+            "place": props.get("place", "Unknown"),
+            "time": props.get("time", 0),
+            "alert_level": (
+                "CRITICAL" if props.get("mag", 0) >= 5
+                else "WARNING" if props.get("mag", 0) >= 3
+                else "INFO"
+            )
         })
 
     cursor.close()
     db.close()
 
     return jsonify({
-        "users": users,
-        "earthquakes": earthquakes
+        "status": "LIVE",
+        "source": "USGS all_hour.geojson",
+        "updated_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "earthquakes": earthquakes,
+        "users": users
     })
 
 
@@ -2301,8 +2711,10 @@ def historic_data_api():
 
 @app.route('/admin/reports')
 def reports_page():
+    if "admin_id" not in session:
+        flash("Please login first.", "warning")
+        return redirect(url_for("admin_login"))
     return render_template('report.html')
-
 
 @app.route('/api/get_historic_data')
 def get_historic_data_api():
@@ -3390,6 +3802,8 @@ def predict():
     # User input
     # ------------------------
     user_lat = user_lon = user_depth = user_date = prediction_val = None
+    risk_level = None
+
 
     if request.method == 'POST':
         try:
@@ -3402,6 +3816,17 @@ def predict():
             arr = np.array([[mapdateTotime(user_date), user_lat, user_lon, user_depth]])
             arr_norm = (arr - X_min) / X_range
             prediction_val = float(model.predict(arr_norm)[0][0]) - 5
+            # ------------------------
+            # Risk level calculation
+            # ------------------------
+            if prediction_val < 3.5:
+                risk_level = "Low"
+            elif prediction_val < 5.0:
+                risk_level = "Medium"
+            elif prediction_val < 6.5:
+                risk_level = "High"
+            else:
+                risk_level = "Severe"
 
             # ✅ DB INSERT (SAFE)
             db = get_db_connection()
@@ -3454,6 +3879,7 @@ def predict():
     return render_template(
         "earth.html",
         prediction=prediction_val,
+        risk_level=risk_level,
         live_quakes=live_quakes,
         rows=rows,
         data=data,
@@ -3645,19 +4071,19 @@ Distance from you: {dist:.2f} km
         "nearest_real_dist_km": nearest_real["distance_km"] if nearest_real else None
     })
 
-
 @app.route('/manual_flood_alert', methods=['POST'])
 def manual_flood_alert():
     from math import radians, sin, cos, sqrt, atan2
     from datetime import datetime
     from flask import request, jsonify
-    import requests, smtplib, ssl
+    import smtplib, ssl
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
     from email.header import Header
+    import requests
 
     # -------------------------------
-    # READ FORM DATA
+    # READ LAT / LON
     # -------------------------------
     try:
         qlat = float(request.form.get("lat"))
@@ -3665,46 +4091,50 @@ def manual_flood_alert():
     except:
         return jsonify({"status": "error", "msg": "Invalid lat/lon"}), 400
 
+    # -------------------------------
+    # DEFAULTS
+    # -------------------------------
+    riverHeading = "✅ River & Dam Safe"
+    floodHeading = "No Flood"
+    floodRiskText = "✅ Flood Risk: None"
+
+    river_discharge = float(request.form.get("river_discharge") or 0)
+    river_level = float(request.form.get("river_level") or 0)
+
+    # 🔥 SINGLE SOURCE OF TRUTH (FRONTEND)
+    if request.form.get("river_heading"):
+        riverHeading = request.form.get("river_heading")
+
+    if request.form.get("flood_heading"):
+        floodHeading = request.form.get("flood_heading")
+
+    if request.form.get("flood_risk_text"):
+        floodRiskText = request.form.get("flood_risk_text")
+
     qtime = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
     # -------------------------------
-    # FETCH LIVE WEATHER (FRESH)
+    # WEATHER FETCH (ONLY DATA)
     # -------------------------------
     apiKey = "fb116bebc392ccc8ab251927edcb55d6"
-
     try:
         res = requests.get(
             f"https://api.openweathermap.org/data/2.5/weather"
             f"?lat={qlat}&lon={qlon}&units=metric&appid={apiKey}",
             timeout=10
         )
-
-        if res.status_code != 200:
-            raise Exception("Weather API failed")
-
         data = res.json()
-
         weatherDesc = data.get("weather", [{}])[0].get("description", "N/A")
         temp = data.get("main", {}).get("temp", 0)
         humidity = data.get("main", {}).get("humidity", 0)
-
-        rain1 = data.get("rain", {}).get("1h", 0)
-        rain3 = data.get("rain", {}).get("3h", 0)
-        snow1 = data.get("snow", {}).get("1h", 0)
-        snow3 = data.get("snow", {}).get("3h", 0)
-
-        precipitation = max(rain1, rain3, snow1, snow3, 0)
         real_place = data.get("name", "Unknown location")
-
-    except Exception:
+    except:
         weatherDesc = "N/A"
-        temp = 0
-        humidity = 0
-        precipitation = 0
+        temp = humidity = 0
         real_place = "Unknown location"
 
     # -------------------------------
-    # HAVERSINE FUNCTION
+    # HAVERSINE
     # -------------------------------
     def haversine(lat1, lon1, lat2, lon2):
         R = 6371
@@ -3714,114 +4144,78 @@ def manual_flood_alert():
         return 2 * R * atan2(sqrt(a), sqrt(1 - a))
 
     # -------------------------------
-    # FETCH USERS (SAFE)
+    # USERS
     # -------------------------------
-    try:
-        db = get_db_connection()
-        cur = db.cursor()
-        cur.execute("SELECT name, email, latitude, longitude FROM users")
-        users = cur.fetchall()
-    except:
-        return jsonify({"status": "error", "msg": "DB error"}), 500
+    db = get_db_connection()
+    cur = db.cursor()
+    cur.execute("SELECT name, email, latitude, longitude FROM users")
+    users = cur.fetchall()
+    cur.close()
+    db.close()
 
+    # -------------------------------
+    # EMAIL CONFIG
+    # -------------------------------
     SMTP_SERVER = "smtp.gmail.com"
     SMTP_PORT = 465
     SMTP_SENDER = "disasterpredictionsystem@gmail.com"
     SMTP_PASSWORD = "pqpbruceisevbjpd"
 
     sent_count = 0
-    nearby_users_found = False
 
-    # -------------------------------
-    # PROCESS USERS
-    # -------------------------------
     for u in users:
-        uname = u["name"]
-        uemail = u["email"]
-        ulat = u["latitude"]
-        ulon = u["longitude"]
-
-        if ulat is None or ulon is None:
+        if not u["latitude"] or not u["longitude"]:
             continue
 
-        try:
-            dist = haversine(float(ulat), float(ulon), qlat, qlon)
-        except:
-            continue
-
+        dist = haversine(float(u["latitude"]), float(u["longitude"]), qlat, qlon)
         if dist <= 10:
-            nearby_users_found = True
 
-            # Flood risk logic (FRESH)
-            if precipitation >= 30:
-                riskText = "🚨 FLOOD ALERT (VERY HIGH)"
-            elif precipitation >= 20:
-                riskText = "⚠️ FLOOD WARNING"
-            elif precipitation >= 10:
-                riskText = "🟡 POSSIBLE FLOOD RISK"
-            else:
-                riskText = "✅ No Flood Risk"
-
-            maps_link = f"https://www.google.com/maps/search/?api=1&query={qlat},{qlon}"
-
-            text = f"""
+            email_text = f"""
 🌊 FLOOD ALERT
 
-{riskText}
+🚨 {floodHeading}
+{floodRiskText}
 
-Rainfall: {precipitation} mm
 Weather: {weatherDesc}
 Temperature: {temp}°C
 Humidity: {humidity}%
+
+🏞 {riverHeading}
+🌍 River Discharge: {river_discharge:.2f} m³/s
+📊 River Level: {river_level:.2f} m
+
 Distance: {dist:.2f} km
 Location: {real_place}
 Time (UTC): {qtime}
-
-{maps_link}
 """
 
             try:
                 msg = MIMEMultipart()
                 msg["Subject"] = Header("🌊 Flood Alert", "utf-8")
                 msg["From"] = SMTP_SENDER
-                msg["To"] = uemail
-                msg.attach(MIMEText(text, "plain", "utf-8"))
+                msg["To"] = u["email"]
+                msg.attach(MIMEText(email_text, "plain", "utf-8"))
 
-                ctx = ssl.create_default_context()
-                with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=ctx) as server:
+                with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=ssl.create_default_context()) as server:
                     server.login(SMTP_SENDER, SMTP_PASSWORD)
-                    server.sendmail(SMTP_SENDER, uemail, msg.as_bytes())
+                    server.sendmail(SMTP_SENDER, u["email"], msg.as_bytes())
 
                 sent_count += 1
-
-            except Exception as e:
-                print("Mail failed:", e)
-
-    cur.close()
-    db.close()
-
-    # -------------------------------
-    # RESPONSE
-    # -------------------------------
-    if not nearby_users_found:
-        return jsonify({
-            "status": "no_users",
-            "msg": "No users found in 10 km radius",
-            "lat": qlat,
-            "lon": qlon,
-            "detected_place": real_place
-        }), 200
+            except:
+                pass
 
     return jsonify({
         "status": "success",
-        "msg": f"Flood alerts sent to {sent_count} users",
         "alerts_sent": sent_count,
         "lat": qlat,
         "lon": qlon,
         "detected_place": real_place,
-        "rainfall_mm": precipitation
+        "flood_heading": floodHeading,
+        "flood_risk_text": floodRiskText,
+        "river_heading": riverHeading,
+        "river_discharge": river_discharge,
+        "river_level": river_level
     }), 200
-
 
 def get_weather_data(lat, lon):
     weather_api = urllib.request.urlopen(
@@ -4450,6 +4844,46 @@ def earthgraph():
     return render_template('earthgraph.html', max=maximum, min=minimum, avg=average, lr=my_list)
 
 
+
+def calculate_river_level(discharge, river_type="medium"):
+    """
+    Model-based river level estimation (rating curve approximation)
+    Discharge (m³/s) → River Level (m)
+    """
+
+    if discharge is None:
+        return None
+
+    # Parameters tuned to real rivers
+    if river_type == "small":
+        a = 0.20
+        b = 0.50
+        bed_level = 0.30
+
+    elif river_type == "large":
+        a = 0.15
+        b = 0.42
+        bed_level = 1.20
+
+    else:  # medium river
+        a = 0.25
+        b = 0.45
+        bed_level = 0.60
+
+    # Dry / zero flow
+    if discharge <= 0:
+        return round(bed_level, 2)
+
+    level = bed_level + a * (discharge ** b)
+
+    # realistic safety clamp (not hard fake)
+    level = max(bed_level, min(level, 25))
+
+    return round(level, 2)
+
+# 🔒 Global cache (file ke top pe)
+RIVER_NAME_CACHE = {}
+
 def check_live_floods_scheduler():
     import requests
     import ssl
@@ -4474,13 +4908,146 @@ def check_live_floods_scheduler():
     THRESHOLD_WARNING = 20
 
     # -------------------------------
-    # DB FETCH (🔥 FIX HERE)
+    # HELPER: FETCH RIVER & DAM
+    # -------------------------------
+    # -------------------------------
+    # HELPER: FETCH NEAREST RIVER NAME
+    # -------------------------------
+    def fetch_river_name(lat, lon, radius=8000):
+        import requests, time, random
+
+        key = (round(lat, 4), round(lon, 4))
+        if key in RIVER_NAME_CACHE:
+            return RIVER_NAME_CACHE[key]
+
+        OVERPASS_SERVERS = [
+            "https://overpass-api.de/api/interpreter",
+            "https://overpass.kumi.systems/api/interpreter",
+            "https://overpass.nchc.org.tw/api/interpreter"
+        ]
+
+        query = f"""
+        [out:json][timeout:10];
+        (
+          way(around:{radius},{lat},{lon})[waterway=river][name];
+          relation(around:{radius},{lat},{lon})[waterway=river][name];
+        );
+        out tags center;
+        """
+
+        for server in OVERPASS_SERVERS:
+            try:
+                time.sleep(random.uniform(1.5, 3.0))  # 🔥 RATE LIMIT SAFE
+
+                r = requests.post(
+                    server,
+                    data=query,
+                    headers={"User-Agent": "FloodWarningApp/1.0"},
+                    timeout=20
+                )
+                r.raise_for_status()
+
+                data = r.json()
+                els = data.get("elements", [])
+
+                if els:
+                    closest = min(
+                        els,
+                        key=lambda el:
+                        (lat - el.get("center", {}).get("lat", el.get("lat", 0))) ** 2 +
+                        (lon - el.get("center", {}).get("lon", el.get("lon", 0))) ** 2
+                    )
+                    name = closest["tags"]["name"]
+                    RIVER_NAME_CACHE[key] = name
+                    return name
+
+            except requests.exceptions.HTTPError as e:
+                print("⚠️ Overpass limited:", server)
+                continue
+            except Exception as e:
+                print("❌ Overpass error:", e)
+                continue
+
+        # FINAL FALLBACK
+        fallback = "No River Nearby"
+        RIVER_NAME_CACHE[key] = fallback
+        return fallback
+
+    # -------------------------------
+    # HELPER: FETCH RIVER & DAM
+    # -------------------------------
+
+    def is_coastal_via_api(lat, lon):
+        import requests
+
+        try:
+            url = (
+                "https://nominatim.openstreetmap.org/reverse"
+                f"?format=jsonv2&lat={lat}&lon={lon}&zoom=10"
+            )
+
+            r = requests.get(
+                url,
+                headers={"User-Agent": "FloodWarningApp/1.0"},
+                timeout=10
+            )
+
+            if r.status_code != 200:
+                return False
+
+            data = r.json()
+            addr = data.get("address", {})
+
+            # ✅ REAL COASTAL SIGNALS
+            if addr.get("sea") or addr.get("ocean"):
+                return True
+
+            # Sometimes coastline tag
+            if addr.get("coastline"):
+                return True
+
+            return False
+
+        except Exception as e:
+            print("⚠️ Coastal API error:", e)
+            return False
+
+    def fetch_river_dam_status(lat, lon):
+        try:
+            url = (
+                "https://flood-api.open-meteo.com/v1/flood"
+                f"?latitude={lat}&longitude={lon}"
+                "&daily=river_discharge&timezone=auto"
+            )
+            r = requests.get(url, timeout=10)
+            if r.status_code != 200:
+                return None, None, "Unable to fetch river/dam data", "Unknown River"
+
+            data = r.json()
+            discharge = data.get("daily", {}).get("river_discharge", [0])[0] or 0
+            river_level = calculate_river_level(discharge)
+
+            # ✅ Fetch nearest river name
+            river_name = fetch_river_name(lat, lon)
+
+            if river_level > 7 or discharge > 7000:
+                status = "🚨 River / Dam Flood Detected"
+            elif river_level > 6 or discharge > 5000:
+                status = "⚠️ River / Dam Warning"
+            else:
+                status = "✅ River & Dam Safe"
+
+            return river_level, discharge, status, river_name
+
+        except Exception as e:
+            return None, None, f"Error fetching river/dam data: {e}", "Nearest River / Water Body"
+
+    # -------------------------------
+    # DB FETCH
     # -------------------------------
     try:
         print("\n📌 Connecting to DB...")
         db = get_db_connection()
-
-        # ✅ IMPORTANT FIX
         cur = db.cursor(pymysql.cursors.DictCursor)
 
         cur.execute("SELECT name, email, latitude, longitude FROM users")
@@ -4501,11 +5068,10 @@ def check_live_floods_scheduler():
         print("--------------------------------")
 
         try:
-            # ✅ FIX: dict access
             name = user["name"]
             email = user["email"]
-            lat = user["latitude"]
-            lon = user["longitude"]
+            lat = float(user["latitude"])
+            lon = float(user["longitude"])
 
             print(f"Name      : {name}")
             print(f"Email     : {email}")
@@ -4513,14 +5079,15 @@ def check_live_floods_scheduler():
             print(f"Longitude : {lon}")
 
             # -------------------------------
-            # VALIDATE COORDINATES
+            # RIVER & DAM API
             # -------------------------------
-            try:
-                lat = float(lat)
-                lon = float(lon)
-            except:
-                print("❌ INVALID COORDINATES → SKIPPED")
-                continue
+            river_level, discharge, river_status, river_name = fetch_river_dam_status(lat, lon)
+
+            print("\n🌊 River & Dam Status:")
+            print("🌊 River Name :", river_name)
+            print("Status    :", river_status)
+            print("River Lv  :", river_level)
+            print("Discharge :", discharge)
 
             # -------------------------------
             # WEATHER API
@@ -4531,44 +5098,52 @@ def check_live_floods_scheduler():
             )
 
             print("\n🌐 Calling OpenWeather API")
-            print("URL:", weather_url)
+            r = requests.get(weather_url, timeout=10)
 
-            try:
-                r = requests.get(weather_url, timeout=10)
-                print("Status Code:", r.status_code)
-
-                if r.status_code != 200:
-                    print("❌ Weather API FAILED")
-                    print("Response:", r.text)
-                    continue
-
-                data = r.json()
-                print("✔ API RESPONSE RECEIVED")
-
-            except Exception as e:
-                print("❌ API REQUEST ERROR:", e)
+            if r.status_code != 200:
+                print("❌ Weather API FAILED")
                 continue
 
-            # -------------------------------
-            # RAW WEATHER DATA
-            # -------------------------------
-            print("\n📦 RAW WEATHER DATA:")
-            print(data)
+            data = r.json()
 
             weather_desc = data.get("weather", [{}])[0].get("description", "N/A")
             temp = data.get("main", {}).get("temp", 0)
             humidity = data.get("main", {}).get("humidity", 0)
+            # -------------------------------
+            # CYCLONE DETECTION
+            # -------------------------------
+            wind_speed = data.get("wind", {}).get("speed", 0) * 3.6  # km/h
+            pressure = data.get("main", {}).get("pressure", 1013)
+
+            cyclone_detected = (
+                    wind_speed >= 62 or
+                    pressure <= 990
+            )
+
+
 
             rain1 = data.get("rain", {}).get("1h", 0)
             rain3 = data.get("rain", {}).get("3h", 0)
             snow1 = data.get("snow", {}).get("1h", 0)
             snow3 = data.get("snow", {}).get("3h", 0)
-
-            precipitation = max(rain1, rain3, snow1, snow3, 0)
-
             # -------------------------------
-            # EXTRACTED VALUES
+            # SNOW MELT LOGIC (REALISTIC)
             # -------------------------------
+            snow_fall = max(snow1, snow3, 0)
+
+            if temp > 0:
+                # ❄️ simple melt model (safe & realistic)
+                snow_melt = round(snow_fall * min(temp / 5, 1), 2)
+            else:
+                snow_melt = 0
+
+            rainfall = max(rain1, rain3, 0)
+            precipitation = rainfall + snow_melt
+
+            print("Rainfall        :", rainfall, "mm")
+            print("Snowfall        :", snow_fall, "mm")
+            print("Snow Melt       :", snow_melt, "mm")
+            print("➡ Total Water   :", precipitation, "mm")
             print("\n📊 EXTRACTED WEATHER")
             print("Description    :", weather_desc)
             print("Temperature    :", temp, "°C")
@@ -4577,20 +5152,70 @@ def check_live_floods_scheduler():
             print("Rain 3h        :", rain3)
             print("Snow 1h        :", snow1)
             print("Snow 3h        :", snow3)
+            print("🌪 Wind Speed :", round(wind_speed, 1), "km/h")
+            print("⬇ Pressure   :", pressure, "hPa")
+            print("🌪 Cyclone   :", cyclone_detected)
             print("➡ Precipitation:", precipitation, "mm")
 
             # -------------------------------
-            # FLOOD LOGIC
+            # CYCLONE STATUS TEXT
             # -------------------------------
-            if precipitation < THRESHOLD_WARNING:
-                print("➖ BELOW WARNING LEVEL → NO ALERT")
+            if cyclone_detected:
+                cyclone_text = (
+                    f"🌪 CYCLONE ALERT\n"
+                    f"Wind Speed: {round(wind_speed, 1)} km/h\n"
+                    f"Pressure: {pressure} hPa\n"
+                )
+            else:
+                cyclone_text = "🌪 Cyclone: Not Detected\n"
+
+            # -------------------------------
+            # RISK FLAGS
+            # -------------------------------
+            # -------------------------------
+            # FLOOD + CYCLONE LOGIC (UI MATCH)
+            # -------------------------------
+            is_coastal = is_coastal_via_api(lat, lon)
+
+            real_flood = (
+                    precipitation >= 30 or
+                    (cyclone_detected and is_coastal and wind_speed >= 89 and precipitation >= 1) or
+                    (cyclone_detected and wind_speed >= 62 and precipitation >= 20)
+            )
+
+            warning_flood = (
+                    precipitation >= 15 or
+                    (cyclone_detected and precipitation >= 5)
+            )
+
+            rain_risk = real_flood or warning_flood
+
+            river_risk = river_status in (
+                "🚨 River / Dam Flood Detected",
+                "⚠️ River / Dam Warning"
+            )
+
+            print("🌧 Rain Risk   :", rain_risk)
+            print("🌊 River Risk :", river_risk)
+
+            # -------------------------------
+            # FINAL ALERT DECISION (STOP CONTINUOUS EMAIL)
+            # -------------------------------
+            if not rain_risk and not river_risk:
+                print("✅ SAFE CONDITION → NO EMAIL SENT")
                 continue
 
-            alert_level = (
-                "🚨 REAL FLOOD ALERT"
-                if precipitation >= THRESHOLD_FLOOD
-                else "⚠️ FLOOD WARNING"
-            )
+            # -------------------------------
+            # ALERT LEVEL
+            # -------------------------------
+            if precipitation >= THRESHOLD_FLOOD:
+                alert_level = "🚨 REAL FLOOD ALERT"
+            elif precipitation >= THRESHOLD_WARNING:
+                alert_level = "⚠️ FLOOD WARNING"
+            elif river_status == "🚨 River / Dam Flood Detected":
+                alert_level = "🚨 RIVER / DAM FLOOD ALERT"
+            else:
+                alert_level = "⚠️ RIVER / DAM WARNING"
 
             print("⚠ ALERT LEVEL:", alert_level)
 
@@ -4598,20 +5223,33 @@ def check_live_floods_scheduler():
             maps_link = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
 
             # -------------------------------
-            # EMAIL
+            # EMAIL CONTENT
             # -------------------------------
-            subject = f"{alert_level} - {precipitation} mm"
+            subject = f"{alert_level} | Rain: {precipitation} mm | {river_status}"
 
             text = f"""
 {alert_level}
 
-Precipitation: {precipitation} mm
-Weather: {weather_desc}
-Temperature: {temp}°C
-Humidity: {humidity}%
+🌧 Rainfall: {rainfall} mm
+❄️ Snow Melt: {snow_melt} mm
+🌦 Weather: {weather_desc}
+🌡 Temperature: {temp} °C
+💧 Humidity: {humidity} %
 
-Location: {lat}, {lon}
-Time: {timestamp}
+{cyclone_text}
+
+🌊 River & Dam Status: {river_status}
+
+            """
+
+            if river_level is not None:
+                text += f"📊 River Level: {river_level} m\n"
+            if discharge is not None:
+                text += f"🌍 Global River Discharge: {discharge} m³/s\n"
+
+            text += f"""
+📍 Location: {lat}, {lon}
+🕒 Time: {timestamp}
 
 {maps_link}
 """
@@ -4621,13 +5259,12 @@ Time: {timestamp}
             print("Subject :", subject)
 
             msg = MIMEMultipart()
-            msg["Subject"] = subject
             msg["From"] = SMTP_SENDER
             msg["To"] = email
+            msg["Subject"] = subject
             msg.attach(MIMEText(text, "plain", "utf-8"))
 
             try:
-                print("🔐 Connecting SMTP...")
                 ctx = ssl.create_default_context()
                 with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=ctx) as server:
                     server.login(SMTP_SENDER, SMTP_PASSWORD)
@@ -4654,131 +5291,188 @@ Time: {timestamp}
     print("\n==============================")
     print("✅ FLOOD SCHEDULER COMPLETED")
     print("==============================")
-
-
 @app.route('/predflood', methods=['GET', 'POST'])
 def predflood():
     import pandas as pd
-    import numpy as np
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from sklearn.model_selection import train_test_split
     from sklearn.linear_model import LinearRegression
-    from flask import request, render_template
+    from flask import request, render_template, session, redirect, url_for
     import requests
     from datetime import datetime
 
     if "user_id" not in session:
         return redirect(url_for("login_page"))
 
-    # -----------------------
-    # Config / keys
-    # -----------------------
     OPENWEATHER_KEY = "fb116bebc392ccc8ab251927edcb55d6"
-    GOOGLE_API_KEY = api_key
 
-    RAINFALL_REAL_FLOOD_MM = 30  # live heavy rain threshold
+    # ---------------- THRESHOLDS ----------------
+    RAINFALL_REAL_FLOOD_MM = 30
+    SNOW_MELT_REAL_FLOOD_MM = 5
 
-    # -----------------------
-    # Load ML training data
-    # -----------------------
+    # Cyclone (IMD / NOAA aligned)
+    CYCLONE_WIND_KMH = 62        # Tropical storm
+    CYCLONE_PRESSURE_HPA = 990  # Strong low pressure
+
+    # ---------------- TRAINING DATA ----------------
     df_rain = pd.read_csv("Hoppers Crossing-Hourly-Rainfall.csv")
     df_river = pd.read_csv("Hoppers Crossing-Hourly-River-Level.csv")
 
     df = pd.merge(df_rain, df_river, how='outer', on=['Date/Time'])
     df['Cumulative rainfall (mm)'] = df['Cumulative rainfall (mm)'].fillna(0)
-    df['Level (m)'] = df['Level (m)'].fillna(0)
+    df['Level (m)'] = df['Level (m)'].interpolate().bfill()
     df = df.drop(columns=['Current rainfall (mm)', 'Date/Time'])
 
-    X = df[['Cumulative rainfall (mm)']].values
-    y = df[['Level (m)']].values
+    df['Snow_melt_mm'] = 0
+    X = df[['Cumulative rainfall (mm)', 'Snow_melt_mm']]
+    y = df[['Level (m)']]
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     regressor = LinearRegression()
-    regressor.fit(X_train, y_train)
+    regressor.fit(X, y)
 
-    # Save plots (optional)
-    plt.scatter(X_train, y_train)
-    plt.plot(X_train, regressor.predict(X_train), color='red')
-    plt.savefig('static/flood/f4.png')
-    plt.close()
-
-    plt.scatter(X_test, y_test, color='red')
-    plt.plot(X_train, regressor.predict(X_train), color='blue')
-    plt.savefig('static/flood/f5.png')
-    plt.close()
-
-    # -----------------------
-    # Default values
-    # -----------------------
-    rainfall_input = 0
+    # ---------------- DEFAULTS ----------------
+    lat = lon = None
+    rainfall_input = snow_melt_input = 0.0
     temp = humidity = 0
     weather_desc = "N/A"
     flood_status = "No Flood"
-    lat = lon = None
-    predictions = [[0, "No Flood"]]
+    cyclone_status = "No Cyclone"
+    wind_kmh = pressure = 0
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # -----------------------
-    # When user inputs lat/lon
-    # -----------------------
+    river_level = dam_discharge = 0.0
+    river_dam_status = "River & Dam Safe"
+
+    predictions = [[0, flood_status, 0, 0]]
+
+    def is_training_basin(lat, lon):
+        return (-38 < lat < -37) and (144 < lon < 145)
+
+    # ---------------- POST ----------------
     if request.method == "POST":
         lat = float(request.form.get("latitude"))
         lon = float(request.form.get("longitude"))
 
-        # --- Fetch live weather
+        # ---------- OPENWEATHER (REAL-TIME) ----------
         try:
-            url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
-            w = requests.get(url, timeout=8).json()
+            w = requests.get(
+                f"https://api.openweathermap.org/data/2.5/weather"
+                f"?lat={lat}&lon={lon}&units=metric&appid={OPENWEATHER_KEY}",
+                timeout=10
+            ).json()
+
             weather_desc = w.get("weather", [{}])[0].get("description", "N/A")
             temp = w.get("main", {}).get("temp", 0)
             humidity = w.get("main", {}).get("humidity", 0)
-            rainfall_input = w.get("rain", {}).get("1h", 0) or w.get("rain", {}).get("3h", 0) or 0
-        except:
-            rainfall_input = 0
 
-        # --- ML predicted river level
+            rain = w.get("rain", {}).get("1h", 0.0)
+            snow = w.get("snow", {}).get("1h", 0.0)
+
+            # ❄️ snow melt (degree-day)
+            if temp > 0:
+                snow_melt_input = round(snow * min(temp / 5, 1), 2)
+            else:
+                snow_melt_input = 0.0
+
+            rainfall_input = rain + snow_melt_input
+
+            # 🌪️ CYCLONE DETECTION (REAL)
+            wind_kmh = round((w.get("wind", {}).get("speed", 0)) * 3.6, 1)
+            pressure = w.get("main", {}).get("pressure", 1013)
+
+            cyclone_detected = (
+                wind_kmh >= CYCLONE_WIND_KMH or
+                pressure <= CYCLONE_PRESSURE_HPA
+            )
+
+            if cyclone_detected:
+                cyclone_status = "Cyclonic System Detected"
+
+        except Exception as e:
+            print("Weather API error:", e)
+            cyclone_detected = False
+
+        # ---------------- OPEN-METEO (HYDRO) ----------------
+        latest_runoff = latest_soil = 0
+
         try:
-            scaled = min(rainfall_input, 100)
-            pred = float(regressor.predict(np.array([[scaled]]))[0][0])
-        except:
-            pred = 0.0
+            m = requests.get(
+                "https://api.open-meteo.com/v1/forecast"
+                f"?latitude={lat}&longitude={lon}"
+                "&hourly=runoff,soil_moisture_0_10cm",
+                timeout=10
+            ).json()
 
-        # --- Determine flood status
+            hourly = m.get("hourly", {})
+            runoff = hourly.get("runoff", [0])
+            soil = hourly.get("soil_moisture_0_10cm", [0])
+
+            latest_runoff = runoff[-1]
+            latest_soil = soil[-1]
+
+            dam_discharge = round(latest_runoff * 120, 2)
+            river_level = round((latest_runoff * 0.8) + (latest_soil * 2), 2)
+
+            if river_level > 7 or dam_discharge > 7000:
+                river_dam_status = "River / Dam Flood Detected"
+            elif river_level > 6 or dam_discharge > 5000:
+                river_dam_status = "River / Dam Warning"
+
+        except Exception as e:
+            print("Open-Meteo error:", e)
+
+        # ---------------- RIVER PREDICTION ----------------
+        if is_training_basin(lat, lon):
+            pred = float(
+                regressor.predict([[rainfall_input * 24, snow_melt_input * 24]])[0][0]
+            )
+        else:
+            pred = round(
+                (latest_runoff * 1.1) +
+                (latest_soil * 1.6) +
+                (rainfall_input * 0.12) +
+                (snow_melt_input * 0.25),
+                3
+            )
+
+        # ---------------- FINAL FLOOD STATUS ----------------
         real_rain = rainfall_input >= RAINFALL_REAL_FLOOD_MM
-        real_river = (pred >= 1.6 and rainfall_input > 20)
+        real_snow = snow_melt_input >= SNOW_MELT_REAL_FLOOD_MM
+        real_river = pred >= 1.6
 
-        if real_rain or real_river:
+        if cyclone_detected or real_rain or real_snow or real_river:
             flood_status = "Real Flood Detected"
-        elif pred >= 1.45:
-            flood_status = "Possible Flood (monitor)"
+        elif pred >= 1.4:
+            flood_status = "Possible Flood (Monitor)"
         else:
             flood_status = "No Flood"
 
-        predictions = [[round(pred, 3), flood_status, round(rainfall_input, 2)]]
+        predictions = [[
+            round(pred, 3),
+            flood_status,
+            round(rainfall_input, 2),
+            round(snow_melt_input, 2)
+        ]]
+
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # -----------------------
-        # IMPORTANT CHANGES:
-        # Auto email sending REMOVED here
-        # Flood alerts will be sent ONLY manually
-        # -----------------------
-
-    # -----------------------
-    # Render results page
-    # -----------------------
+    # ---------------- RENDER ----------------
     return render_template(
         "floodres.html",
         predictions=predictions,
         lat=lat,
         lon=lon,
-        rainfall_input=rainfall_input,
+        rainfall_input=round(rainfall_input, 2),
+        snow_melt=round(snow_melt_input, 2),
         flood_status=flood_status,
+        cyclone_status=cyclone_status,
+        wind_kmh=wind_kmh,
+        pressure=pressure,
         temp=temp,
         humidity=humidity,
         weather_desc=weather_desc,
-        timestamp=timestamp
+        timestamp=timestamp,
+        river_level=river_level,
+        dam_discharge=dam_discharge,
+        river_dam_status=river_dam_status
     )
 
     # print(predicted_riverlevel)

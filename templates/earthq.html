@@ -23,6 +23,9 @@
       integrity="sha384-EVSTQN3/azprG1Anm3QDgpJLIm9Nao0Yz1ztcQTwFspd3yD65VohhpuuCOmLASjC"
       crossorigin="anonymous"
     />
+      <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
     <script
       src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/js/bootstrap.bundle.min.js"
       integrity="sha384-MrcW6ZMFYlzcLA8Nl+NtUVF0sA7MsXsP1UyJoMp4YLEuNSfAP+JcXn/tWtIaxVXM"
@@ -464,7 +467,7 @@ textarea:focus{
                     type="submit"
                     class="btn btn-primary mb-3"
                     id="submit"
-                    value="Submit"
+                    value="Predict"
                   />
                 </form>
               </div>
@@ -549,36 +552,95 @@ textarea:focus{
     <script src="{{url_for('static', filename='script.js')}}"></script>
 
     <script>
-      var map;
-      function initMap() {
-        map = new google.maps.Map(document.getElementById("map"), {
-          zoom: 2,
-          center: new google.maps.LatLng(2.8, -187.3),
-          mapTypeId: "terrain",
-        });
+document.addEventListener("DOMContentLoaded", function () {
 
-        // Create a <script> tag and set the USGS URL as the source.
-        var script = document.createElement("script");
-        // This example uses a local copy of the GeoJSON stored at
-        // http://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_week.geojsonp
-        script.src =
-          "https://developers.google.com/maps/documentation/javascript/examples/json/earthquake_GeoJSONP.js";
-        document.getElementsByTagName("head")[0].appendChild(script);
-      }
+  var map = L.map('map').setView([20, 77], 5);
 
-      // Loop through the results array and place a marker for each
-      // set of coordinates.
-      window.eqfeed_callback = function (results) {
-        for (var i = 0; i < results.features.length; i++) {
-          var coords = results.features[i].geometry.coordinates;
-          var latLng = new google.maps.LatLng(coords[1], coords[0]);
-          var marker = new google.maps.Marker({
-            position: latLng,
-            map: map,
+  // 🌍 Base map
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+
+  // CircleMarker color by magnitude
+  function quakeColor(mag) {
+    if (mag >= 5) return "red";
+    if (mag >= 3) return "orange";
+    return "blue";
+  }
+
+  var quakeLayer = L.layerGroup().addTo(map);
+  var userMarker = null;
+
+  // 🔹 Normalize longitude to [-180, 180]
+  function normalizeLon(lon) {
+    return ((lon + 180) % 360 + 360) % 360 - 180;
+  }
+
+  async function fetchLatestQuakes() {
+    try {
+      const res = await fetch("https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson");
+      const data = await res.json();
+
+      quakeLayer.clearLayers();
+
+      L.geoJSON(data, {
+        pointToLayer: function (feature, latlng) {
+          let mag = feature.properties.mag || 0;
+          const lon = normalizeLon(latlng.lng);
+
+          const circle = L.circleMarker([latlng.lat, lon], {
+            radius: mag * 2.5,
+            fillColor: quakeColor(mag),
+            color: "#000",
+            weight: 1,
+            opacity: 1,
+            fillOpacity: 0.8
+          }).addTo(quakeLayer);
+
+          circle.bindPopup(
+            `<b>🌎 Earthquake</b><br>
+             Magnitude: ${mag}<br>
+             Location: ${feature.properties.place}<br>
+             Time: ${new Date(feature.properties.time).toLocaleString()}`
+          );
+
+          circle.on('click', function () {
+            document.getElementById('lat').value = latlng.lat.toFixed(6);
+            document.getElementById('lon').value = lon.toFixed(6);
+
+            if (userMarker) map.removeLayer(userMarker);
+            userMarker = L.marker([latlng.lat, lon]).addTo(map);
+            circle.openPopup();
           });
-        }
-      };
 
+          return circle;
+        }
+      });
+
+    } catch (err) {
+      console.error("USGS fetch error:", err);
+    }
+  }
+
+  fetchLatestQuakes();
+  setInterval(fetchLatestQuakes, 2 * 60 * 1000);
+
+  // Map click anywhere else → auto-fill lat/lon
+  map.on('click', function (e) {
+    const lat = e.latlng.lat;
+    const lon = normalizeLon(e.latlng.lng);
+
+    document.getElementById('lat').value = lat.toFixed(6);
+    document.getElementById('lon').value = lon.toFixed(6);
+
+    if (userMarker) map.removeLayer(userMarker);
+    userMarker = L.marker([lat, lon]).addTo(map)
+      .bindPopup("Latitude: " + lat.toFixed(6) + "<br>Longitude: " + lon.toFixed(6))
+      .openPopup();
+  });
+
+});
       function toggleTheme(){
   document.body.classList.toggle("dark");
 }

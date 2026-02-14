@@ -30,9 +30,13 @@
       href="https://fonts.googleapis.com/css?family=Montserrat"
       rel="stylesheet"
     />
+      <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
     <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.3.1/jquery.min.js"></script>
     <script src="https://maxcdn.bootstrapcdn.com/bootstrap/3.4.0/js/bootstrap.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/110/three.js"></script>
+
     <script src="http://www.webglearth.com/v2/api.js"></script>
     <script>
       var earth;
@@ -261,6 +265,24 @@ select,
   box-shadow:0 4px 10px rgba(0,0,0,.05) !important;
   transition:.25s ease;
 }
+
+/* ================= DARK MODE INPUT FIX ================= */
+body.dark input,
+body.dark textarea,
+body.dark select,
+body.dark .form-control{
+  background: rgba(15,23,42,0.92) !important; /* solid dark */
+  color: #e5e7eb !important;                  /* visible text */
+  border-color: rgba(255,255,255,0.15) !important;
+  box-shadow: 0 6px 16px rgba(0,0,0,.45) !important;
+}
+
+body.dark input::placeholder,
+body.dark textarea::placeholder{
+  color: #94a3b8 !important;
+}
+
+
 
 input::placeholder,
 textarea::placeholder{
@@ -537,7 +559,7 @@ select:focus,
                 {% endif %}
 
                 <!-- Map container -->
-                <div id="map" style="height:500px; width:100%; margin-top:20px;"></div>
+                 <div id="map" style="height:500px; width:100%; margin-top:20px;"></div>
               </div>
             </div>
           </div>
@@ -555,13 +577,148 @@ select:focus,
     <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
 
     <script>
-      // Initialize map
-      var map = L.map('map').setView([20, 77], 5); // default center
+// JS
+document.addEventListener("DOMContentLoaded", function () {
 
-      // Add OpenStreetMap tiles
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        maxZoom: 19
-      }).addTo(map);
+  // ================= MAP INIT =================
+  var map = L.map('map').setView([20, 77], 5);
+
+  var baseLayer = L.tileLayer(
+    'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }
+  ).addTo(map);
+
+  const WEATHER_API_KEY = "fb116bebc392ccc8ab251927edcb55d6";
+
+  var rainLayer = L.tileLayer(
+    `https://tile.openweathermap.org/map/precipitation_new/{z}/{x}/{y}.png?appid=${WEATHER_API_KEY}`,
+    { opacity: 0.7 }
+  );
+
+  var snowLayer = L.tileLayer(
+    `https://tile.openweathermap.org/map/snow/{z}/{x}/{y}.png?appid=${WEATHER_API_KEY}`,
+    { opacity: 0.7 }
+  );
+
+  L.control.layers(
+    { "🗺️ Normal Map": baseLayer },
+    { "🌧️ Rainfall": rainLayer, "❄️ Snow": snowLayer }
+  ).addTo(map);
+
+  // ================= MARKERS =================
+  let marker = null;
+  let cycloneMarker = null;
+
+  function normalizeLon(lon) {
+    return ((lon + 180) % 360 + 360) % 360 - 180;
+  }
+
+  // -------- Normal Marker --------
+  function updateMarker(lat, lon) {
+    lon = normalizeLon(lon);
+
+    if (marker) map.removeLayer(marker);
+
+    marker = L.marker([lat, lon])
+      .addTo(map)
+      .bindPopup(`
+        📍 <b>Location</b><br>
+        Lat: ${lat.toFixed(5)}<br>
+        Lon: ${lon.toFixed(5)}
+      `)
+      .openPopup();
+
+    document.getElementById('latitude').value = lat.toFixed(6);
+    document.getElementById('longitude').value = lon.toFixed(6);
+
+    map.setView([lat, lon], map.getZoom());
+  }
+
+  // ================= REAL-TIME CYCLONE CHECK =================
+  async function checkCyclone(lat, lon) {
+    const url = `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&appid=${WEATHER_API_KEY}&units=metric`;
+
+    try {
+      const res = await fetch(url);
+      const data = await res.json();
+
+      if (!data.wind || !data.main) return null;
+
+      const windSpeed = data.wind.speed; // m/s
+      const pressure = data.main.pressure; // hPa
+
+      // 🌪️ Cyclone condition (scientific approx)
+      if (windSpeed >= 17 && pressure <= 1000) {
+        return {
+          category: windSpeed >= 33 ? "Severe Cyclone" : "Cyclonic Storm",
+          windSpeed: windSpeed,
+          stormSurge: (windSpeed / 10).toFixed(1)
+        };
+      }
+
+      return null; // ❌ no cyclone
+
+    } catch (err) {
+      console.error("Weather API error", err);
+      return null;
+    }
+  }
+
+  // -------- Cyclone Marker --------
+  function updateCycloneMarker(lat, lon, cyclone) {
+    if (cycloneMarker) {
+      map.removeLayer(cycloneMarker);
+      cycloneMarker = null;
+    }
+
+    if (!cyclone) return; // ✅ cyclone nahi → kuch bhi mat dikhao
+
+    const cycloneIcon = L.icon({
+      iconUrl: "https://upload.wikimedia.org/wikipedia/commons/8/8d/Tropical_cyclone_icon.svg",
+      iconSize: [48, 48],
+      iconAnchor: [24, 24]
+    });
+
+    cycloneMarker = L.marker([lat, lon], { icon: cycloneIcon })
+      .addTo(map)
+      .bindPopup(`
+        🌀 <b>Cyclone Detected</b><br>
+        Category: ${cyclone.category}<br>
+        💨 Wind: ${(cyclone.windSpeed * 3.6).toFixed(1)} km/h<br>
+        🌊 Estimated Surge: ${cyclone.stormSurge} m
+      `)
+      .openPopup();
+  }
+
+  // ================= MAP CLICK =================
+  map.on('click', async function (e) {
+    const lat = e.latlng.lat;
+    const lon = e.latlng.lng;
+
+    updateMarker(lat, lon);
+
+    const cyclone = await checkCyclone(lat, lon);
+    updateCycloneMarker(lat, lon, cyclone);
+  });
+
+  // ================= INPUT CHANGE =================
+  const latInput = document.getElementById('latitude');
+  const lonInput = document.getElementById('longitude');
+
+  function inputChanged() {
+    const lat = parseFloat(latInput.value);
+    const lon = parseFloat(lonInput.value);
+
+    if (!isNaN(lat) && !isNaN(lon)) {
+      updateMarker(lat, lon);
+    }
+  }
+
+  latInput.addEventListener('change', inputChanged);
+  lonInput.addEventListener('change', inputChanged);
+
+});
+
 
 {% if predictions %}
 <div class="mt-4">
@@ -583,47 +740,53 @@ document.addEventListener("DOMContentLoaded", () => {
   const lonInput = document.getElementById("longitude");
   const rainInput = document.getElementById("rainfall_amt");
 
+  // Accept numbers like: 123, -123, 123.45, -123.45
   const decimalRegex = /^-?\d+(\.\d+)?$/;
 
   form.addEventListener("submit", (e) => {
     let errors = [];
 
+    // Clean values from whitespace
+    const latVal = latInput.value.trim();
+    const lonVal = lonInput.value.trim();
+    const rainVal = rainInput.value.trim();
+
     // LATITUDE
-    if (!decimalRegex.test(latInput.value)) {
+    if (!decimalRegex.test(latVal)) {
       errors.push("Latitude must be a decimal number");
     } else {
-      const lat = parseFloat(latInput.value);
+      const lat = parseFloat(latVal);
       if (lat < -90 || lat > 90) {
         errors.push("Latitude must be between -90 and 90");
       }
     }
 
     // LONGITUDE
-    if (!decimalRegex.test(lonInput.value)) {
+    if (!decimalRegex.test(lonVal)) {
       errors.push("Longitude must be a decimal number");
     } else {
-      const lon = parseFloat(lonInput.value);
+      const lon = parseFloat(lonVal);
       if (lon < -180 || lon > 180) {
         errors.push("Longitude must be between -180 and 180");
       }
     }
 
     // RAINFALL (OPTIONAL)
-    if (rainInput.value.trim() !== "") {
-      if (!decimalRegex.test(rainInput.value)) {
+    if (rainVal !== "") {
+      if (!decimalRegex.test(rainVal)) {
         errors.push("Rainfall must be a valid decimal number");
-      } else if (parseFloat(rainInput.value) < 0) {
+      } else if (parseFloat(rainVal) < 0) {
         errors.push("Rainfall cannot be negative");
       }
     }
 
-    // BLOCK SUBMIT + ALERT
     if (errors.length > 0) {
       e.preventDefault();
       alert(errors.join("\n"));
     }
   });
 });
+
 
           function confirmLogout() {
     return confirm("Are you sure you want to logout?");

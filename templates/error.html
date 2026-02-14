@@ -1,10 +1,88 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>$Title$</title>
+    <meta charset="UTF-8">
+    <title>{{ title or "Service Unavailable" }}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: Arial, Helvetica, sans-serif;
+            background: #0f172a;
+            color: #e5e7eb;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            text-align: center;
+        }
+
+        .box {
+            max-width: 480px;
+            background: #020617;
+            padding: 35px;
+            border-radius: 12px;
+            box-shadow: 0 0 25px rgba(0,0,0,0.6);
+        }
+
+        h1 {
+            font-size: 28px;
+            margin-bottom: 10px;
+            color: #38bdf8;
+        }
+
+        p {
+            font-size: 16px;
+            color: #cbd5f5;
+            line-height: 1.6;
+        }
+
+        .code {
+            margin-top: 18px;
+            font-size: 14px;
+            color: #64748b;
+        }
+
+        .spinner {
+            margin: 25px auto 0;
+            width: 40px;
+            height: 40px;
+            border: 4px solid #1e293b;
+            border-top: 4px solid #38bdf8;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
 </head>
 <body>
-$END$
+
+<div class="box">
+    <h1>{{ title or "Maintenance Mode" }}</h1>
+
+    <p>
+        {{ message | safe }}
+    </p>
+
+    <div class="spinner"></div>
+
+    <div class="code">
+        Error Code: {{ code or 503 }}
+    </div>
+</div>
+
+<script>
+    // auto-refresh every 5 sec
+    setTimeout(() => {
+        location.reload();
+    }, 5000);
+</script>
+
 </body>
 </html>
