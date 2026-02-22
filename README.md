@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 <h1 align="center" id="title">🌊 Natural Disaster Prediction Model 🌊</h1>
 
 <p></p>
@@ -60,3 +61,6 @@ python prediction.py // contains code for all the models
 ```shell
 https://drive.google.com/drive/folders/19iHZznAFgMqU9lcAsW8urVa9h80A9hy4?usp=sharing
 ```
+=======
+# disaster-prediction-system-global-earthquake-weather-alert-monitoring
+>>>>>>> fc286b02859621c92ed4956f18552608c11ad3b9
